@@ -1,0 +1,33 @@
+# Local development / smoke testing.
+#
+# Usage:
+#   1. Generate a keypair:    yarn keygen
+#   2. Set the secret in a .env file:
+#        ATTESTOR_SECRET_BASE58=<from keygen>
+#        NETWORK=localnet
+#   3. docker-compose up
+#
+# For production deploys, use the Dockerfile directly with your
+# orchestrator (ECS, k8s, Nomad) and source the secret from a real
+# secret manager — NOT a .env file.
+
+services:
+  attestor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ar-io-escrow-attestor:dev
+    restart: unless-stopped
+    ports:
+      - "3030:3030"
+    environment:
+      - ATTESTOR_SECRET_BASE58=${ATTESTOR_SECRET_BASE58:?required, run yarn keygen}
+      - NETWORK=${NETWORK:-localnet}
+      - PORT=3030
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - RATE_LIMIT_PER_MIN=${RATE_LIMIT_PER_MIN:-30}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3030/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
