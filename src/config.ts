@@ -11,6 +11,11 @@
 //!   PORT                  — HTTP port (default 3030)
 //!   LOG_LEVEL             — pino log level (default "info")
 //!   RATE_LIMIT_PER_MIN    — per-IP request budget per minute (default 30)
+//!   CORS_ALLOWED_ORIGINS  — comma-separated exact origins allowed to call
+//!                           the API from a browser (e.g. a locally-run
+//!                           escrow app: "http://localhost:5173"). Unset =
+//!                           no CORS headers emitted (the production
+//!                           deployment's fronting gateway owns CORS).
 
 import bs58 from "bs58";
 
@@ -26,6 +31,8 @@ export interface Config {
   maxConcurrentVerifies: number;
   network: string;
   attestor: AttestorKeypair;
+  /** Exact origins allowed via CORS; empty = emit no CORS headers. */
+  corsAllowedOrigins: string[];
 }
 
 export function loadConfig(): Config {
@@ -54,6 +61,10 @@ export function loadConfig(): Config {
     maxConcurrentVerifies: parseInt(process.env.MAX_CONCURRENT_VERIFIES ?? "10", 10),
     network,
     attestor,
+    corsAllowedOrigins: (process.env.CORS_ALLOWED_ORIGINS ?? "")
+      .split(",")
+      .map((o) => o.trim())
+      .filter((o) => o.length > 0),
   };
 }
 
