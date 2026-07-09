@@ -14,7 +14,7 @@
 
 import bs58 from "bs58";
 
-import { loadAttestorKeypair, type AttestorKeypair } from "./attest.js";
+import { loadAttestorKeypair, type AttestorKeypair } from "@ar.io/attestor-canonical";
 
 export interface Config {
   port: number;

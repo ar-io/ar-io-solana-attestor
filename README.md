@@ -5,6 +5,16 @@ signatures and re-signs the same canonical message with Ed25519, so the
 Solana escrow program can verify the (cheap) Ed25519 signature
 on-chain instead of the (impossibly expensive on Solana BPF) RSA-PSS.
 
+> **Monorepo note.** This repo is a yarn workspace (classic v1, pinned via
+> corepack). The attestor lives in `packages/attestor`; its
+> verification-pure crypto (canonical messages, RSA-PSS verify, Ed25519
+> attest) is the shared `packages/canonical` (`@ar.io/attestor-canonical`)
+> library, also consumed by the new `packages/claims` service. See
+> [`SPEC.md`](SPEC.md) for the layout and `docs/claims/BUILD.md` for the
+> claims build plan. Run workspace scripts from the repo root
+> (`yarn build`, `yarn test`, `yarn lint`) or target one package with
+> `yarn workspace @ar.io/escrow-attestor <script>`.
+
 ## Why
 
 Solana's `sol_big_mod_exp` syscall is feature-gated and blocked on every
@@ -95,11 +105,12 @@ service matches the program-baked attestor pubkey constant.
 ## Quickstart (local)
 
 ```bash
-yarn install
-yarn keygen
+yarn install                 # at the repo root — installs the whole workspace
+yarn keygen                  # root passthrough to the attestor keygen CLI
 # Copy the SECRET line into a .env file (or your shell environment).
 
-ATTESTOR_SECRET_BASE58=... NETWORK=localnet yarn dev
+ATTESTOR_SECRET_BASE58=... NETWORK=localnet \
+  yarn workspace @ar.io/escrow-attestor dev
 ```
 
 The `keygen` command also prints the public key — that goes into the
@@ -110,14 +121,16 @@ gets baked into the program at deploy time.
 ## Test
 
 ```bash
-yarn test
+yarn test                    # builds the shared lib, then tests every workspace
 ```
 
-Runs 35 tests across:
-- RSA-PSS verifier (real keypairs, sign-and-verify round-trip, tampering, wrong modulus, salt-length edge cases)
-- Canonical message builder (byte-format, no trailing newline, base58 / hex encoding)
-- Ed25519 attest sign-and-verify
-- Full HTTP round-trip (Express in-process, real RSA keypair → real Ed25519 verify)
+Runs the attestor + shared-crypto suites (53 tests) plus the claims
+skeleton placeholder, across:
+- RSA-PSS verifier (real keypairs, sign-and-verify round-trip, tampering, wrong modulus, salt-length edge cases) — `packages/canonical`
+- Canonical message builder (byte-format, no trailing newline, base58 / hex encoding) + attestor ↔ Rust byte-parity — `packages/canonical`
+- Ed25519 attest sign-and-verify — `packages/canonical`
+- Full HTTP round-trip (Express in-process, real RSA keypair → real Ed25519 verify) — `packages/attestor`
+- Claims `/health` placeholder (Fastify `app.inject`) — `packages/claims`
 
 ## Production deploy
 

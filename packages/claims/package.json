@@ -1,0 +1,38 @@
+{
+  "name": "@ar.io/claims",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Centralized claim-dispenser service (Option B) for the AO->Solana migration. M0 scaffold only: HTTP server + Postgres + config. Ledger, verification, and dispatch land in M1-M4.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "test": "node --test --import tsx src/health.test.ts",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "typecheck:tests": "tsc -p tsconfig.tests.json",
+    "migrate": "node-pg-migrate",
+    "migrate:up": "node-pg-migrate up",
+    "migrate:down": "node-pg-migrate down",
+    "migrate:create": "node-pg-migrate create"
+  },
+  "dependencies": {
+    "@solana/kit": "^2.1.0",
+    "fastestsmallesttextencoderdecoder": "^1.0.22",
+    "fastify": "^5.2.0",
+    "node-pg-migrate": "^7.9.0",
+    "pg": "^8.13.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

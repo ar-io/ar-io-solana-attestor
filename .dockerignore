@@ -1,0 +1,29 @@
+# Build context is the repo root (see docker-compose.yml). Keep host-only
+# and generated artifacts out of the image so `COPY packages/<svc>` can't
+# pull a stray node_modules/dist or a secret-bearing .env.
+
+# Dependencies + build output (installed/compiled fresh inside the image).
+node_modules
+**/node_modules
+dist
+**/dist
+
+# Secrets & local env (root .env holds the attestor seed; never copy it).
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# VCS, CI, editor, and docs that the runtime image doesn't need.
+.git
+.github
+.gitignore
+.dockerignore
+*.md
+**/*.md
+
+# Logs, OS cruft.
+*.log
+.DS_Store

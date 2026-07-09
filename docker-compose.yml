@@ -1,21 +1,44 @@
-# Local development / smoke testing.
+# Local development / smoke testing for the whole workspace.
+#
+# Brings up Postgres + the attestor + the claims service. Build context
+# is the repo root for both services (they live in a yarn workspace and
+# the attestor imports the shared @ar.io/attestor-canonical package).
 #
 # Usage:
-#   1. Generate a keypair:    yarn keygen
-#   2. Set the secret in a .env file:
+#   1. Generate an attestor keypair:   yarn keygen
+#   2. Put the secret in a .env file at the repo root:
 #        ATTESTOR_SECRET_BASE58=<from keygen>
 #        NETWORK=localnet
-#   3. docker-compose up
+#   3. docker compose up --build
 #
-# For production deploys, use the Dockerfile directly with your
-# orchestrator (ECS, k8s, Nomad) and source the secret from a real
-# secret manager — NOT a .env file.
+# Apply the (empty M0) claims migration once Postgres is up:
+#   docker compose run --rm claims yarn workspace @ar.io/claims migrate:up
+#
+# For production, use the per-service Dockerfiles with your orchestrator
+# and source secrets from a real secret manager — NOT a .env file.
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-claims}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-claims}
+      POSTGRES_DB: ${POSTGRES_DB:-claims}
+    ports:
+      - "5432:5432"
+    volumes:
+      - claims_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-claims} -d ${POSTGRES_DB:-claims}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   attestor:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: packages/attestor/Dockerfile
     image: ar-io-escrow-attestor:dev
     restart: unless-stopped
     ports:
@@ -31,3 +54,31 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+  claims:
+    build:
+      context: .
+      dockerfile: packages/claims/Dockerfile
+    image: ar-io-claims:dev
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3040:3040"
+    environment:
+      - DATABASE_URL=postgres://${POSTGRES_USER:-claims}:${POSTGRES_PASSWORD:-claims}@postgres:5432/${POSTGRES_DB:-claims}
+      - NETWORK=${NETWORK:-localnet}
+      - PORT=3040
+      - HOST=0.0.0.0
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      # SOLANA_RPC_URL defaults per NETWORK; override for a local validator.
+      - SOLANA_RPC_URL=${SOLANA_RPC_URL:-http://host.docker.internal:8899}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3040/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  claims_pgdata:

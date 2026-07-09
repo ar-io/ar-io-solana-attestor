@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feat/ar-io-claims]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: install / lint / typecheck / test
+    runs-on: ubuntu-latest
+
+    # Postgres service container for the claims workspace: exercised by
+    # the migration step (the empty M0 migration must apply against a
+    # fresh DB) and available to any DB-touching tests added later.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: claims
+          POSTGRES_PASSWORD: claims
+          POSTGRES_DB: claims
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U claims -d claims"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      NETWORK: localnet
+      DATABASE_URL: postgres://claims:claims@localhost:5432/claims
+      # The attestor <-> Rust canonical parity test self-skips when the
+      # contracts repo / cargo aren't present (they aren't in CI), so no
+      # Rust toolchain is required here.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Enable Corepack (pins yarn to packageManager field)
+        run: corepack enable
+
+      - name: Install (frozen lockfile)
+        run: yarn install --frozen-lockfile
+
+      - name: Build (shared lib first, then services)
+        run: yarn build
+
+      - name: Lint + typecheck (tsc --noEmit across workspaces)
+        run: yarn lint
+
+      - name: Typecheck claims test files
+        working-directory: packages/claims
+        run: yarn typecheck:tests
+
+      - name: Apply claims migrations (empty initial migration)
+        working-directory: packages/claims
+        run: yarn migrate:up
+
+      # Runs the canonical cross-parity GOLDEN layer (TS builders vs the
+      # frozen deployed-contract vectors) with no Rust toolchain — this is
+      # the fail-closed byte-parity gate. The live-Rust drift layer is a
+      # visible skip here; a release job re-runs it with the contracts repo
+      # + REQUIRE_RUST_PARITY=1 to catch contract-side drift.
+      - name: Test (all workspaces)
+        run: yarn test

@@ -1,0 +1,10 @@
+{
+  "//": "Typecheck-only pass that INCLUDES the claims test files (the build/lint config excludes *.test.ts). tsx only type-strips at runtime, so this catches genuine type errors in claims test code. Scoped to the claims package deliberately: the legacy attestor/canonical suites are kept frozen (type-stripped by tsx, as they were pre-workspace), so we don't churn them for a new gate.",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false
+  },
+  "include": ["src/**/*"]
+}

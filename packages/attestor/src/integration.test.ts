@@ -19,8 +19,7 @@ import * as ed25519 from "@noble/ed25519";
 import { sha512 } from "@noble/hashes/sha2";
 import type { Server } from "node:http";
 
-import { buildAntEscrowClaimMessage } from "./canonical.js";
-import { RSA_4096_BYTES } from "./verify-rsa-pss.js";
+import { buildAntEscrowClaimMessage, RSA_4096_BYTES } from "@ar.io/attestor-canonical";
 
 ed25519.etc.sha512Sync = (...m) => sha512(ed25519.etc.concatBytes(...m));
 

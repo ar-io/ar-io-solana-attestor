@@ -10,14 +10,15 @@ import pino from "pino";
 import bs58 from "bs58";
 
 import { loadConfig, type Config } from "./config.js";
-import { buildAntEscrowClaimMessage, buildEscrowClaimMessage } from "./canonical.js";
 import {
+  buildAntEscrowClaimMessage,
+  buildEscrowClaimMessage,
   RSA_4096_BYTES,
   RsaPssError,
   deriveArweaveAddress,
   verifyRsaPss,
-} from "./verify-rsa-pss.js";
-import { signAttestation } from "./attest.js";
+  signAttestation,
+} from "@ar.io/attestor-canonical";
 
 const config: Config = loadConfig();
 const log = pino({ level: config.logLevel });
