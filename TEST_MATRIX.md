@@ -57,6 +57,31 @@ claims `/health` placeholder. Rows 1–8 are the acceptance targets for
 M1–M4 and are listed here so the tester can track coverage as each
 milestone lands.
 
+## M1 status — ledger + reconciliation (this milestone)
+
+The two M1 cross-cutting rows above are now **implemented and green** on the
+real mainnet frozen inputs:
+
+- **Bit-exact reconciliation** — `yarn workspace @ar.io/claims reconcile:ledger`
+  reproduces every would-be on-chain deposit from the AUTHORITATIVE solana-ar-io
+  code and diffs the built ledger: **10,711/10,711 tuples matched, PASS**
+  (ant=2269 · token seed 8031 · vault seed 411; Σ 73,277,178.58 ARIO). Manifest
+  phase counters reproduce the published gate exactly: **2,269 ANT · 5,374 token
+  · 111 vault · 2,957 stake = 10,711**, phase-2 token outflow 48,264,957.23 ARIO.
+- **AT-RISK = 136 manual_review** — the 136 owners with no recoverable key load
+  as `recipients.status = manual_review` (182 of their assets flagged
+  `assets.status = manual_review`), excluded from the reconciled/claimable
+  (`available`) set.
+
+Reconciliation independence is unit-tested (`reconcile.test.ts`: catches
+amount / type / recipient / missing / extra divergence) and the derivation
+primitives have golden-vector tests (`ant-mint.test.ts` proves the noble/kit
+ANT-mint == web3.js `Keypair.fromSeed`; `asset-id.test.ts` pins the seed
+formats incl. the ETH case-stability lesson). The schema migrates up/down;
+`build.db.test.ts` round-trips the persisted ledger. Rows 7/8 (cancel-*) are
+custody/admin-plane behaviors that land with the admin endpoints in M3+; M1
+only builds the ledger they operate on.
+
 ## Note on ADR-022 vs ADR-027 (vault settlement)
 
 `escrow-claim-runner.ts` currently reflects the **ADR-022** on-chain

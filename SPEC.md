@@ -275,3 +275,163 @@ All commands run from the repo root with corepack-pinned yarn 1.22.22.
   `@solana/kit` bump (the `ws` / text-encoder peers can shift).
 - **Docker image bloat:** the shared-node_modules simplification (decision
   7) — fine for M0, flag if it matters for image-size budgets.
+
+## M1 — Ledger + reconciliation
+
+Populates the `recipients` + `assets` ledger from the frozen mainnet capture
+(`/programs/ario-snapshot/output-mainnet-prod-remediation/`), reproducing what
+the deployed on-chain `batch-escrow.ts` would deposit, and proves it **bit-exact**
+against an INDEPENDENT re-derivation.
+
+### Schema (migration `1720000001000_ledger_schema.sql`)
+
+Four tables per pivot plan §3.1: `recipients`, `assets`, `claims`, `audit_log`.
+M1 populates the first two; `claims`/`audit_log` are created (complete, reviewable)
+but exercised in M3+/M6. Two documented adjustments to §3.1:
+
+1. **AT-RISK owners load `status = 'manual_review'`** (BUILD.md non-negotiable),
+   not `'frozen'`. Their assets get rows too, flagged `assets.status =
+   'manual_review'` — flagged, not deleted; an operator queue reads them.
+2. **`recipients.recipient_pubkey` is nullable** (AT-RISK owners never published
+   a key), guarded by `CHECK (status = 'manual_review' OR recipient_pubkey IS NOT
+   NULL)`. Plus shape CHECKs (ant⇒mint,no-amount; non-ant⇒amount; nonce=32B) and
+   the `one_live_claim_per_asset` partial-unique index. Migrates up **and** down
+   cleanly (verified).
+
+### Ledger builder (`src/ledger/`, `src/cli/build-ledger.ts`)
+
+Pure planner `buildLedgerPlan(inputs, {antMintSecret, nowMs})` reproduces
+batch-escrow's four phases EXACTLY, then `writeLedger` persists it (one tx,
+idempotent upsert, nonce preserved on re-run). Fidelity points:
+
+- **Owner selection** = unmapped via the normalized address-map
+  (`makeNormalizedAddressMap`, ETH case-insensitive — the B6Nf lesson); the
+  `AO_PROCESS_ID` self-balance is excluded from token escrow.
+- **asset_id seeds** identical to the deployed path: token
+  `sha256("token-escrow:"+normAddr)`, vault `sha256("vault-escrow:"+normAddr+
+  ":"+vaultId)`, stake `sha256(<escrow-extract seed>)`; ANT key =
+  `deriveAntMintBase58(processId, secret)`.
+- **ANT mint** derived with `@noble/ed25519` (`Keypair.fromSeed(seed).publicKey`
+  ≡ `ed25519.getPublicKey(seed)`) — **no `@solana/web3.js` in claims runtime**
+  (BUILD.md), proven byte-identical to web3.js via the frozen `ANT_MINT_FIXTURES`.
+- **Fallbacks** mirror batch-escrow: expired vault → liquid token escrow;
+  sub-min / short-lock vault → liquid token escrow (`vaultEscrowFallsBackToLiquid`);
+  operator-exit vaults extended (not liquid-expedited); stake vault/liquid routing
+  via the authoritative `collectStakeWithdrawalEscrow` shape.
+- **Money is integer `bigint` (mARIO)** throughout; amounts land in `NUMERIC(20,0)`.
+- **Time pin:** the vault/stake liquid-vs-vault split depends on "now" (lock =
+  unlock − now). The build PINS `LEDGER_NOW_MS`, default **1783641600000**
+  (2026-07-10T00:00:00Z) — the reference that reproduces the frozen dry-run gate
+  (2269/5374/111/2957). Env-overridable; the reconciler uses the same pin.
+
+The DB `asset_type` is the **on-chain deposit instruction** the frontend claims
+against (`ant`|`token`|`vault` = `deposit_ant`|`deposit_tokens`|`deposit_vault`),
+so stake and expired/fallback vaults correctly surface as `token` (liquid). The
+`source` JSONB carries phase provenance (aoProcessId / arweaveAddress / vaultId /
+planKind / onchainSeed) for the operator queue.
+
+### Reconciliation — how it stays INDEPENDENT (the tester will probe this hardest)
+
+`src/reconcile/authoritative.ts` derives the would-be-deposit set WITHOUT any of
+the builder's code, by importing the **deployed solana-ar-io modules directly**
+(`SOLANA_AR_IO_IMPORT_SRC`, default the standard checkout):
+
+- `normalize-address.ts` — the real `normalizeSourceAddress` /
+  `makeNormalizedAddressMap` (the unmapped filter + ETH casing).
+- `derive-ant-mint.ts` — the real `deriveAntMintPubkey` (web3.js
+  `Keypair.fromSeed`, resolved from solana-ar-io's own node_modules). All 2,269
+  ANT mints are graded against web3.js, not against the builder's noble copy.
+- `batch-escrow.ts` — the real **`deriveTokenAssetId` / `deriveVaultAssetId`**
+  (the escrow asset_id = the money identifier). batch-escrow now `export`s these
+  (a visibility-only, committed change in solana-ar-io); importing the module
+  does NOT run its argv-guarded `main()`.
+- `planning/escrow-extract.ts` — the real stake/withdrawal set + `assetIdSeed`s.
+- `planning/vault-plan.ts` — the real `vaultEscrowFallsBackToLiquid` + constants.
+
+**Why the asset_ids are imported, not guarded (a tester-found fix).** The first
+M1 cut source-guarded the token/vault seed via a bare `.includes()` substring.
+The tester changed the deployed `deriveTokenAssetId` to append `+ ':v2'` — a REAL
+asset_id change — and the substring still matched (a superset contains its
+substring) → **false PASS 10711/10711**. Importing and calling the real function
+closes this completely: reproducing the `:v2` change now drops matched to 5,350
+(exactly the 5,361 Phase-2 token deposits that use `deriveTokenAssetId` diverge)
+→ FAIL. The remaining INLINE bits with no exported function — the stake
+`sha256(<authoritative seed>)` step, the vault expired check + ms→s lock formula,
+and the stake operator-exit extension — are still pinned to the live source via
+`assertSourceGuards()`, but now with **DELIMITER-BOUNDED byte-exact snippets**
+(each includes its surrounding `const … ;` / `),` boundary), so an
+append/superset — the exact class the tester exploited — shifts the delimiter and
+FAILS the match (unit-tested in `source-guard.test.ts`). The AO self-balance
+exclusion id is regex-extracted (fail-closed). Net: every money identifier and
+bug-prone predicate is the authoritative code; only trivial arithmetic remains,
+byte-pinned append-proof. Because the builder (self-contained copies) and the
+reconciler (authoritative imports) are **different code paths**, a bug in the
+builder's reimplementation shows up as a diff.
+
+`reconcile()` diffs the tuple **(assetType, assetKey, amount, recipient bytes)**
+per asset over the `available` set (AT-RISK `manual_review` rows are batch-escrow
+skips, so they are excluded from the compare, matching on-chain). `RECONCILE_SOURCE=db`
+reads the persisted ledger (proves persistence); `=plan` reconciles the in-memory
+plan (CI/no-DB). Both the authoritative side AND the builder side are checked
+against the published gate numbers independently.
+
+### Reconciliation result (real mainnet inputs, `RECONCILE_SOURCE=db`)
+
+```
+authoritative counters: ant=2269 tokenEscrowed=5374 vaultEscrowed=111 stakeEscrowed=2957
+built (plan)  counters: ant=2269 tokenEscrowed=5374 vaultEscrowed=111 stakeEscrowed=2957
+built assets 10711 / authoritative 10711 / matched 10711
+seed counts (both): ant=2269 token=8031 vault=411
+Σ mARIO built == authoritative == 73277178580427 (73,277,178.58 ARIO)
+recipients=8347 (8136 frozen moduli + 136 AT-RISK + 75 ETH) assets=10893 (available 10711 + manual_review 182)
+RESULT: PASS — bit-exact
+```
+
+Proven that the gate CATCHES divergence: a +1 mARIO tamper on one DB asset →
+`amount_mismatch`, RESULT FAIL, exit 1.
+
+### Running it
+
+```bash
+# Postgres up + migrated:
+DATABASE_URL=... yarn workspace @ar.io/claims migrate:up
+# Build the ledger from the frozen inputs:
+FROZEN_INPUTS_DIR=/programs/ario-snapshot/output-mainnet-prod-remediation \
+ANT_MINT_SECRET="$(tr -d '\n' < keys/mainnet/ant-mint-secret.txt)" \
+DATABASE_URL=... yarn workspace @ar.io/claims build:ledger
+# Reconcile the persisted ledger vs the authoritative deposits (exit 0 = PASS):
+FROZEN_INPUTS_DIR=... ANT_MINT_SECRET=... DATABASE_URL=... \
+SOLANA_AR_IO_IMPORT_SRC=/home/vilenarios/source/solana-ar-io/migration/import/src \
+yarn workspace @ar.io/claims reconcile:ledger
+```
+
+### Not wired into CI (deliberate)
+
+The reconciliation GATE needs the solana-ar-io repo, the ~6 MB frozen inputs, and
+`ANT_MINT_SECRET` — none present in CI. CI runs the fast unit tests that cover the
+derivation logic (plan / asset-id / ant-mint / reconcile diff engine) plus the DB
+round-trip against the Postgres service. The bit-exact gate is a local/ops run
+(the tester reproduces it with the same repos + inputs).
+
+### What I could not fully verify / caveats
+
+- The reconciliation depends on `SOLANA_AR_IO_IMPORT_SRC` pointing at the deployed
+  batch-escrow tree. It is a **local** gate by design (see above); it is not a
+  hermetic CI check.
+- The vault/stake liquid-vs-vault split is **time-sensitive** (stake vaults nearly
+  all fall back to liquid by 2026-07-10 because their unlocks are close). The build
+  pins `nowMs` so the ledger is deterministic and matches the frozen dry-run gate.
+  The published oracle counts (2269/5374/111/2957) are now explicitly coupled to
+  that instant via `EXPECTED_GATE.nowMs` + `gateAppliesAt(nowMs)`: at any other pin
+  the CLI **loudly skips** the hardcoded oracle and relies on the (nowMs-agnostic)
+  bit-exact diff — no silent mismatch on a cutover re-pin. The eventual real
+  cutover re-pins `nowMs` to the dispatch window (M4's claim-time vault settlement
+  re-computes remaining live regardless).
+- The token/vault escrow asset_ids are now **authoritative-imported** (batch-escrow
+  exports `deriveTokenAssetId`/`deriveVaultAssetId`; committed there). The one spot
+  the first cut got wrong — a substring source-guard that a `+ ':v2'` superset
+  slipped past → false PASS — is fixed and regression-tested (`source-guard.test.ts`
+  + the live `:v2` demo). The residual inline bits (stake sha256-of-authoritative-
+  seed, vault ms→s lock arithmetic, operator-exit extension) are byte-pinned with
+  delimiter-bounded append-proof snippets; they affect only `asset_type`
+  routing/arithmetic, never the asset_id / amount / recipient (all authoritative).

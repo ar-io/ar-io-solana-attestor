@@ -37,9 +37,14 @@ jobs:
       COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
       NETWORK: localnet
       DATABASE_URL: postgres://claims:claims@localhost:5432/claims
-      # The attestor <-> Rust canonical parity test self-skips when the
-      # contracts repo / cargo aren't present (they aren't in CI), so no
-      # Rust toolchain is required here.
+      # Canonical parity is fail-closed via a TWO-LAYER golden design:
+      #   Layer 1 (golden vectors) — TS builders vs canonical.cross.golden.json,
+      #     the frozen deployed-contract bytes. ALWAYS runs here, no Rust
+      #     toolchain, and HARD-FAILS on any TS drift.
+      #   Layer 2 (live-Rust drift) — re-derives from a freshly built Rust
+      #     example to catch a contract-side canonical change. Needs cargo + the
+      #     contracts repo, so it is a VISIBLE skip in CI (turned into a hard
+      #     fail only under REQUIRE_RUST_PARITY=1 — see the N3 TODO at EOF).
 
     steps:
       - uses: actions/checkout@v4
@@ -68,10 +73,19 @@ jobs:
         working-directory: packages/claims
         run: yarn migrate:up
 
-      # Runs the canonical cross-parity GOLDEN layer (TS builders vs the
-      # frozen deployed-contract vectors) with no Rust toolchain — this is
-      # the fail-closed byte-parity gate. The live-Rust drift layer is a
-      # visible skip here; a release job re-runs it with the contracts repo
-      # + REQUIRE_RUST_PARITY=1 to catch contract-side drift.
+      # Runs every workspace's tests: canonical Layer-1 golden parity (fail-
+      # closed, no Rust), the attestor suite, and the claims M1 ledger + reconcile
+      # unit tests. The claims DB round-trip test runs against the Postgres
+      # service (DATABASE_URL above); the M1 reconciliation GATE itself is a
+      # local/ops run (needs the solana-ar-io repo + the frozen mainnet inputs +
+      # ANT_MINT_SECRET), so it is not wired into CI — see SPEC.md.
       - name: Test (all workspaces)
         run: yarn test
+
+# --- TODO (M7): N3 — scheduled live-Rust parity job ---------------------------
+# Add a `schedule:`-triggered job (or a separate workflow) that checks out
+# ar-io-solana-contracts, installs the Rust toolchain, and runs the canonical
+# cross test under REQUIRE_RUST_PARITY=1 so Layer 2 (live-Rust drift detection)
+# runs on a cadence — catching a contract-side canonical change the frozen
+# golden file would not otherwise see. Deferred to M7 (ops hardening); NOT built
+# now.
