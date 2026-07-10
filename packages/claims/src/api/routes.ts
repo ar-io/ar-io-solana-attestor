@@ -27,6 +27,16 @@ import {
   type CompleteInput,
   type InitiateInput,
 } from "./service.js";
+import {
+  getAnchorList,
+  getAuditLog,
+  getLedgerProof,
+  getPublishedLedger,
+  getReserves,
+} from "./transparency.js";
+import { createRpc } from "../solana.js";
+import { SolanaChainGateway } from "../dispatch/chain.js";
+import { loadTransparencyConfig } from "../transparency/config.js";
 
 export interface ClaimsRoutesDeps {
   config: Config;
@@ -130,6 +140,68 @@ export function registerClaimsRoutes(app: FastifyInstance, deps: ClaimsRoutesDep
       const { claimId } = req.params as { claimId: string };
       const res = await getClaim(pool, claimId);
       reply.send(res);
+    } catch (e) {
+      sendApiError(reply, e);
+    }
+  });
+
+  // --- Transparency (M6, §6.5) — public read-only proofs of correct custody. ---
+  const tconfig = loadTransparencyConfig();
+  // Lazily-built RPC + gateway for the on-chain reserves reads (kit; no web3.js).
+  let reservesRpc: ReturnType<typeof createRpc> | undefined;
+  let reservesGateway: SolanaChainGateway | undefined;
+  const ensureReservesChain = (): { rpc: ReturnType<typeof createRpc>; gateway: SolanaChainGateway } => {
+    if (!reservesRpc) reservesRpc = createRpc(config.solanaRpcUrl);
+    if (!reservesGateway) reservesGateway = new SolanaChainGateway(reservesRpc);
+    return { rpc: reservesRpc, gateway: reservesGateway };
+  };
+
+  // GET /v1/transparency/ledger — signed manifest (+leaves when ?full=1; ?id= for a
+  // specific historical publish, else the latest).
+  app.get("/v1/transparency/ledger", async (req, reply) => {
+    try {
+      const q = req.query as { full?: string; id?: string };
+      reply.send(await getPublishedLedger(pool, { full: q.full === "1" || q.full === "true", id: q.id }));
+    } catch (e) {
+      sendApiError(reply, e);
+    }
+  });
+
+  // GET /v1/transparency/ledger/proof?assetKey=[&id=]
+  app.get("/v1/transparency/ledger/proof", async (req, reply) => {
+    try {
+      const q = req.query as { assetKey?: string; id?: string };
+      reply.send(await getLedgerProof(pool, q.assetKey ?? "", q.id));
+    } catch (e) {
+      sendApiError(reply, e);
+    }
+  });
+
+  // GET /v1/transparency/log?sinceSeq=&limit=
+  app.get("/v1/transparency/log", async (req, reply) => {
+    try {
+      const q = req.query as { sinceSeq?: string; limit?: string };
+      reply.send(await getAuditLog(pool, { sinceSeq: q.sinceSeq, limit: q.limit ? parseInt(q.limit, 10) : undefined }));
+    } catch (e) {
+      sendApiError(reply, e);
+    }
+  });
+
+  // GET /v1/transparency/anchors?kind=&limit=
+  app.get("/v1/transparency/anchors", async (req, reply) => {
+    try {
+      const q = req.query as { kind?: "audit-head" | "ledger-root"; limit?: string };
+      reply.send(await getAnchorList(pool, { kind: q.kind, limit: q.limit ? parseInt(q.limit, 10) : undefined }));
+    } catch (e) {
+      sendApiError(reply, e);
+    }
+  });
+
+  // GET /v1/transparency/reserves — live on-chain holdings vs ledger liability.
+  app.get("/v1/transparency/reserves", async (_req, reply) => {
+    try {
+      const { rpc, gateway } = ensureReservesChain();
+      reply.send(await getReserves({ pool, gateway, rpc, tconfig, network: config.network }));
     } catch (e) {
       sendApiError(reply, e);
     }

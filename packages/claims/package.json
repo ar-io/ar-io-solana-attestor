@@ -23,7 +23,10 @@
     "dispatch:worker": "tsx src/cli/dispatch-worker.ts",
     "dispatch:ants": "tsx src/cli/dispatch-ants.ts",
     "dispatch:approve": "tsx src/cli/approve-claim.ts",
-    "reconcile:dispatch": "tsx src/cli/reconcile-dispatch.ts"
+    "reconcile:dispatch": "tsx src/cli/reconcile-dispatch.ts",
+    "publish:ledger": "tsx src/cli/publish-ledger.ts",
+    "anchor:audit-log": "tsx src/cli/anchor-audit-log.ts",
+    "verify:transparency": "tsx src/cli/verify-transparency.ts"
   },
   "dependencies": {
     "@ar.io/attestor-canonical": "0.1.0",

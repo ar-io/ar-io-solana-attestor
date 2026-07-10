@@ -1,12 +1,14 @@
-//! audit_log append (M3 writes the rows; M6 signs them).
+//! audit_log append (M3 writes the rows; M6 signs + anchors them).
 //!
 //! Every claim state transition (initiate / complete / reject / expire /
 //! pending_review) appends one row here, carrying enough to reconstruct the
-//! claim. M3's remit is "just write the rows" — but we already write a REAL
-//! sha256 hash chain (`entry_hash = sha256(prev_hash || canonical_json(entry))`)
-//! so M6 only has to add the Ed25519 signature over `entry_hash` with the
-//! separate AUDIT key. The `signature` column is NOT NULL, so M3 stores a
-//! 64-byte zero placeholder and documents the swap.
+//! claim. M3's remit was "just write the rows" — with a REAL sha256 hash chain
+//! (`entry_hash = sha256(prev_hash || canonical_json(entry))`). M6 adds the
+//! Ed25519 signature over `entry_hash` with the SEPARATE audit key: when an
+//! audit signer is registered via `setAuditSigner`, new rows are signed on
+//! write; otherwise a 64-byte zero placeholder is stored and the M6 anchor CLI
+//! back-fills the signature (`signUnsignedAuditRows`). Either way the chain is
+//! independently verifiable and, once anchored on-chain, tamper-evident.
 //!
 //! The chain is kept linear under concurrency with a transaction-scoped
 //! advisory lock (`pg_advisory_xact_lock`), taken INSIDE this helper — i.e.
@@ -19,8 +21,23 @@ import type { PoolClient } from "pg";
 /** Stable advisory-lock key for serializing audit-log appends (arbitrary). */
 const AUDIT_ADVISORY_KEY = 748_291_003n;
 
-/** 64-byte zero placeholder; M6 replaces with an Ed25519 audit-key signature. */
-const UNSIGNED_PLACEHOLDER = Buffer.alloc(64);
+/** 64-byte zero placeholder; back-filled with an Ed25519 audit-key signature. */
+export const UNSIGNED_PLACEHOLDER = Buffer.alloc(64);
+
+/**
+ * Optional process-wide audit signer. When set (M6 service boot), `appendAudit`
+ * signs each new row's `entry_hash` on write. Kept as a pluggable hook so the
+ * M3/M4 code paths that call `appendAudit` need no signature-awareness and the
+ * default (unset) behavior — placeholder + later back-fill — is unchanged.
+ */
+export interface AuditEntrySigner {
+  /** Sign a 32-byte entry hash, returning a 64-byte Ed25519 signature. */
+  signEntryHash(entryHash: Buffer): Buffer;
+}
+let auditSigner: AuditEntrySigner | null = null;
+export function setAuditSigner(signer: AuditEntrySigner | null): void {
+  auditSigner = signer;
+}
 
 export interface AuditEntry {
   /** e.g. "claim.initiate" | "claim.verified" | "claim.rejected" | ... */
@@ -70,10 +87,26 @@ export async function appendAudit(client: PoolClient, entry: AuditEntry): Promis
     .update(Buffer.from(json, "utf8"))
     .digest();
 
+  // Sign on write when an audit signer is registered (M6); else placeholder,
+  // back-filled by the anchor CLI. Signing over entry_hash (immutable) means a
+  // later back-fill produces the identical signature.
+  const signature = auditSigner ? auditSigner.signEntryHash(entryHash) : UNSIGNED_PLACEHOLDER;
+
   await client.query(
     "INSERT INTO audit_log (prev_hash, entry, entry_hash, signature) VALUES ($1, $2::jsonb, $3, $4)",
-    [prevHash, json, entryHash, UNSIGNED_PLACEHOLDER],
+    [prevHash, json, entryHash, signature],
   );
 }
 
-export { canonicalJson as _canonicalJsonForTest };
+/**
+ * Recompute an entry's hash from `prevHash` and the entry object as stored in
+ * the `entry` jsonb column. MUST reproduce the bytes `appendAudit` hashed, so it
+ * uses the SAME canonical serialization. The verifier (audit-chain.ts) folds
+ * this across the whole log to prove linkage independently of the DB.
+ */
+export function computeEntryHash(prevHash: Buffer, entry: unknown): Buffer {
+  const json = canonicalJson(entry);
+  return createHash("sha256").update(prevHash).update(Buffer.from(json, "utf8")).digest();
+}
+
+export { canonicalJson, canonicalJson as _canonicalJsonForTest };

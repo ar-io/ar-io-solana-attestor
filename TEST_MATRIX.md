@@ -145,6 +145,31 @@ ArioConfig + vault ATA); SPL Memo disabled in the surfnet proof (datasource
 wouldn't clone the Memo program; product default on, made optional so it never
 blocks a dispense). Both detailed in `SPEC.md` → "M4 caveats".
 
+## M6 — transparency (signed ledger + anchored audit log + reserves)
+
+| # | Scenario | Harness | Expected |
+|---|----------|---------|----------|
+| T1 | Merkle root + membership proof | unit | every index proves for n∈{1..33}; deterministic; domain-separated |
+| T2 | **Ledger tamper detection** | unit | altered amount / removed leaf / hidden `manual_review` → root ≠ signed root → FAIL |
+| T3 | Publisher signature | unit | verifies with the publisher pubkey; wrong key → invalid |
+| T4 | Membership self-check | unit + DB | tampered claimed leaf no longer folds to the committed root |
+| T5 | Audit hash-chain linkage | unit | recompute `entry_hash` + `prev_hash`; altered content / broken link / forged sig detected |
+| T6 | **Log extends anchored head** | unit + live | chain up to anchored seq reproduces the anchored hash |
+| T7 | **Rewrite detection** | unit + live | rewriting a row at/before the anchor → hash diverges → FAIL |
+| T8 | Sign-on-write / back-fill | unit (mock) + DB | `setAuditSigner` signs new rows; `signUnsignedAuditRows` back-fills placeholders (batched) |
+| T9 | **Anchor lands ON-CHAIN** | live devnet | Solana memo tx confirmed (`Memo1Uhk…`); memo read back FROM CHAIN |
+| T10 | Reserves coverage | DB + live devnet | reserve ≥ outstanding → covered; unfunded → shortfall flagged; balances read LIVE via kit |
+| T11 | Reserves internal consistency | DB | `covered == (reserve ≥ outstanding)`, `surplus == reserve − outstanding` |
+| T12 | Live ANT-owner read | live devnet | `readCoreOwner` == authority for an on-chain MPL Core asset |
+| T13 | Endpoints wired | DB (inject) | `/v1/transparency/{ledger,ledger/proof,log,anchors,reserves}` reachable + shaped |
+
+Live devnet proof: `scripts/m6-devnet-proof.ts` — 7/7 phases PASS (anchor tx
+`3aik6XKT…`, slot 475288747). Residuals: anchored on devnet not mainnet;
+Arweave data-item anchoring is a documented "and/or" extension (Solana memo
+implemented); the `MEMO_PROGRAM` constant in `dispatch/instructions.ts` (v2 id)
+is DEAD on devnet+mainnet — anchoring uses the live `Memo1Uhk…` program (M4
+latent-bug finding). Details in `SPEC.md` → "M6 caveats".
+
 ## Note on ADR-022 vs ADR-027 (vault settlement)
 
 `escrow-claim-runner.ts` currently reflects the **ADR-022** on-chain

@@ -990,3 +990,146 @@ each with a regression test:
 Full suite after the fixes: **attestor 11 + canonical 49 unchanged**, **claims
 223 (no DB) / 286 (with DB)**; the live surfpool proof re-run green (now
 exercising the operator ANT-batch flow end-to-end on-chain).
+
+## M6 — Transparency (signed ledger + anchored audit log + reserves)
+
+Keeps the centralized custodian auditable-after-the-fact (pivot plan §6.5, a
+stated non-negotiable). All code in `packages/claims/src/transparency/` +
+`src/api/transparency.ts` + migration `1720000004000_transparency.sql`; CLIs in
+`src/cli/`. **`@solana/kit` only** (no web3.js); money stays integer `bigint`
+mARIO. Three keys, all SEPARATE from the treasury + attestor keys.
+
+### Keys (`transparency/keys.ts`) — separable blast radii
+
+Two Ed25519 keys, distinct from the hot dispenser (treasury) and the attestor
+signing key (BUILD.md non-negotiable), loaded with the same at-rest discipline as
+the treasury key (sealed AES-256-GCM blob via `crypto-box.ts`, passphrase
+injected separately; a bare `*_SEED_BASE64` is localnet/tests only):
+
+- **AUDIT** key — signs each `audit_log.entry_hash` (schema §3.1: "Ed25519 over
+  entry_hash by the AUDIT key (≠ attestor, ≠ treasury)").
+- **LEDGER_PUBLISHER** key — signs the published-ledger manifest AND is the
+  fee-payer/signer of the on-chain anchor memo tx (the "ledger-publisher/anchor"
+  key). `assertTransparencyKeysSeparable` guards audit ≠ publisher.
+
+### 1. Published, signed ledger (`ledger-artifact.ts` + `merkle.ts`)
+
+A deterministic, third-party-verifiable commitment. Each asset → a canonical
+LEAF (`recipientId, protocol, assetKey, assetType, amount, antMint, vaultEndTs,
+status` — **no secrets**: no nonce, no modulus; `recipientId` is already a public
+sha256 handle). Leaves are sorted by `assetKey` and committed under a **binary
+Merkle tree** (`merkle.ts`): domain-separated hashing (`leaf = sha256(0x00‖data)`,
+`node = sha256(0x01‖L‖R)` — closes CVE-2012-2459) and **promote-on-odd** (no
+ambiguous duplicate pair). The root + counts + totals + input fingerprints form a
+MANIFEST, signed by the publisher key. `buildLeavesFromDb` reads all non-cancelled
+assets (available + `manual_review` AT-RISK, marked as such — nothing that affects
+claimability trust is excluded).
+
+- **Verifier** (`verifyLedgerArtifact`, `proveMembership`/`verifyMembership`, and
+  the standalone `cli/verify-transparency.ts artifact <file>`): re-derives the
+  root from the leaves, checks it equals the signed manifest root + verifies the
+  publisher signature, then proves a single asset's membership with ~log₂(N)
+  sibling hashes. **Tamper detection**: any altered/removed leaf changes the root
+  → the publisher signature no longer matches → flagged; a tampered leaf in a
+  membership proof no longer folds to the committed root → flagged.
+- **Publish**: `cli/publish-ledger.ts` (`yarn publish:ledger`) builds+signs the
+  artifact, self-verifies, persists an immutable snapshot to `published_ledger`,
+  and writes the artifact JSON (upload to Arweave/IPFS for permanence).
+
+### 2. Tamper-evident audit-log anchoring (`audit-chain.ts` + `anchor.ts`)
+
+The M1/M3 `audit_log` sha256 hash chain is verified independently
+(`verifyAuditChain`: recompute every `entry_hash` from the stored `entry` jsonb
+via the SAME `canonicalJson`, check the hash AND the `prev_hash` linkage; a
+suffix can be verified with `initialPrevHash`). The AUDIT key signs each
+`entry_hash` — on write when `setAuditSigner` is registered (M6 service boot),
+else the placeholder is back-filled by `signUnsignedAuditRows` (batched UPDATE).
+
+The current chain HEAD (`{seq, entryHash}`) is anchored on-chain as a **Solana
+Memo tx** signed by the publisher/anchor key (`submitAnchor` → SIGN→broadcast→
+confirm via the M4 chain gateway), recorded in `audit_anchors`. `cli/anchor-audit-log.ts`
+(`yarn anchor:audit-log`) back-fills signatures, verifies the full chain (refuses
+to anchor a broken one), and posts the anchor; cadence + target are configurable
+(`ANCHOR_TARGET`, cron interval; Arweave data-item is a documented "and/or"
+extension). A verifier confirms extension: `fetchAnchorMemo` reads the memo BACK
+FROM CHAIN (does not trust the DB), and `checkExtendsAnchor` confirms the live log
+still reproduces the anchored hash at the anchored seq — a rewrite at/before that
+seq diverges and is flagged.
+
+**Memo-program finding (latent M4 bug).** The `MEMO_PROGRAM` constant in
+`dispatch/instructions.ts` (`MemoSq4gq4qMz6H4dS7YEG2KDsF7hCkQqRr5dW5CtBc`, the
+"v2" id) resolves to **NO account on devnet OR mainnet** (verified via
+`getAccountInfo` on both public RPCs). The SPL Memo program actually deployed on
+both clusters is `Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo` (executable). This
+is exactly the "surfpool would not clone the Memo program" note in the M4 caveats
+— the address itself is dead. M6 anchoring uses the live program
+(`LIVE_MEMO_PROGRAM`, override `ANCHOR_MEMO_PROGRAM`). **M4's claim memo would
+fail in production if enabled** — flagged for the M4 owner (M4 made the memo
+optional/off, so no live impact today).
+
+### 3. Reserves / proof-of-holdings (`reserves.ts`)
+
+`GET /v1/transparency/reserves` (`computeReserves`) reports LIVE on-chain holdings
+vs the ledger liability so anyone can check holdings ≥ liabilities:
+
+- **Reserve side, read live via `@solana/kit`** (never DB-asserted): hot ARIO
+  float = SPL balance of the treasury dispenser ATA; cold reserve = SPL balance of
+  the cold-reserve owner's ATA; ANT holdings = a live sample of outstanding ANT
+  mints whose on-chain Owner == the authority (`sampleAntHoldings`/`readCoreOwner`,
+  offset-1 of AssetV1), or a full `getProgramAccounts` count (`RESERVES_ANT_CHECK`).
+- **Liability side, from the ledger** (`readLiabilities`): outstanding mARIO =
+  Σ token/vault amount not yet claimed/cancelled; outstanding ANTs = count.
+- **Coverage**: `tokenVaultCovered = totalReserve ≥ outstanding`, `surplusMario`,
+  `antCovered`.
+
+### Endpoints + wiring
+
+`src/api/transparency.ts` + `routes.ts`: `GET /v1/transparency/ledger[?id=&full=1]`,
+`/ledger/proof?assetKey=[&id=]` (membership proof + self-check), `/log[?sinceSeq=&limit=]`,
+`/anchors[?kind=&limit=]`, `/reserves`. `/health/ready` gains `ledgerRootHash` +
+`auditLogHead` (§4.1, best-effort). The reserves route builds a kit RPC + gateway
+lazily. CLIs: `yarn publish:ledger`, `yarn anchor:audit-log`, `yarn verify:transparency`.
+
+### Verification performed (M6)
+
+- **Unit (no DB/chain, `transparency/*.test.ts` + `api/audit.signer.test.ts`):**
+  Merkle root/proof for n∈{1,2,3,4,5,7,8,16,33} + tamper (modified leaf/sibling,
+  deleted leaf) + domain separation; artifact build/verify/membership + tamper
+  (altered amount, removed leaf, hidden `manual_review`) + wrong-publisher-key;
+  audit-chain linkage/signature/altered-content/broken-link/forged-sig + extends
+  vs rewrite-detection; anchor memo build/parse + the live-vs-dead memo-program
+  assertion; sign-on-write hook (mock client).
+- **DB-backed (`transparency.db.test.ts`, `api/transparency.http.test.ts`):**
+  concurrency-safe (READ-ONLY over the shared append-only `audit_log`; own rows
+  read BY ID): publish + read-back + membership + tamper; deterministic
+  build-from-DB; reserves coverage math (huge-covers / zero-shortfall / internal
+  consistency) with an on-chain-balance fake; anchors round-trip; HTTP endpoints.
+- **LIVE on devnet (`scripts/m6-devnet-proof.ts`, single-process, self-restoring):**
+  all 7 phases PASS — (1) fund an ephemeral anchor key; (2) ledger verifies +
+  membership + tamper; (3) **audit head anchored ON-CHAIN** (real memo tx
+  `3aik6XKT…`, slot 475288747, `Memo1Uhk…` success), memo read back FROM CHAIN,
+  log confirmed to EXTEND the anchored head, rewrite detected; (4) reserves — a
+  cold reserve funded to cover the live ledger liability, read LIVE via kit
+  (cold == 81,147,797.204002 ARIO ≥ outstanding 81,147,796.204002), unfunded →
+  NOT covered, live ANT-owner read. DB restored (no signed rows / no appended
+  rows / no published_ledger / no anchors left behind).
+- Full suite green: **attestor 11 + canonical 49 unchanged**, **claims 339**
+  (+48). `build`/`typecheck`/`typecheck:tests`/`lint` clean; migration
+  `1720000004000_transparency` up + down verified.
+
+### What I could NOT fully verify / caveats (M6)
+
+- **Anchoring proven on DEVNET, not mainnet** (as scoped). The mechanism is
+  cluster-agnostic; mainnet just needs the anchor key funded + `NETWORK` set.
+- **The production `anchor-audit-log` CLI refuses a broken chain** (`verifyAuditChain`
+  must pass before anchoring). The SHARED dev DB's `audit_log` has deletion-induced
+  gaps from prior M3/M4 test cleanups (append-only is a production invariant), so
+  the CLI won't anchor against it as-is; the live proof anchors a controlled clean
+  SUFFIX instead. On a real append-only mainnet log the CLI runs end-to-end.
+- **Arweave data-item anchoring is a documented extension** (the plan's "and/or").
+  The Solana-memo path is implemented + proven; Arweave would add a Turbo upload +
+  a `target='arweave'` branch (schema already allows it).
+- **ANT holdings default to sampling** (`getProgramAccounts` is heavy / often
+  RPC-disabled). The live proof exercises the `readCoreOwner` primitive; a full
+  live sample against the 2,269 real ANT mints needs mainnet (they don't exist on
+  devnet).

@@ -11,6 +11,7 @@ import type { Config } from "./config.js";
 import type { Db } from "./db.js";
 import { registerClaimsRoutes } from "./api/routes.js";
 import { createRateLimiters, type RateLimiters } from "./api/rate-limit.js";
+import { getTransparencyStatus } from "./api/transparency.js";
 
 export interface BuildAppOptions {
   config: Config;
@@ -55,7 +56,20 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     }
     try {
       await db.ping();
-      return { ready: true, db: "up" };
+      // Best-effort transparency head (§4.1): the published ledger root + audit
+      // chain head. Never fails readiness — a fresh DB has neither yet.
+      let transparency: Awaited<ReturnType<typeof getTransparencyStatus>> | undefined;
+      try {
+        transparency = await getTransparencyStatus(db.pool);
+      } catch {
+        transparency = undefined;
+      }
+      return {
+        ready: true,
+        db: "up",
+        ledgerRootHash: transparency?.ledgerRootHash ?? null,
+        auditLogHead: transparency?.auditLogHead ?? null,
+      };
     } catch (err) {
       reply.code(503);
       return { ready: false, db: "down", detail: (err as Error).message };
