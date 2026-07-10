@@ -10,7 +10,7 @@
 //! a regression that fails if the exploit is reintroduced.
 
 import { strict as assert } from "node:assert";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { after, before, describe, it } from "node:test";
 import {
@@ -48,6 +48,7 @@ import { computeReserves, readLiabilities } from "./reserves.js";
 import { getAssociatedTokenAddress } from "../dispatch/instructions.js";
 import type { ChainGateway } from "../dispatch/chain.js";
 import { createDb, type Db } from "../db.js";
+import { cleanup, insertAsset, insertRecipient, randomClaimant } from "../api/proof-testkit.js";
 
 const PUB = keypairFromSeed("publisher", new Uint8Array(32).fill(11));
 const EVIL = keypairFromSeed("publisher", new Uint8Array(32).fill(66));
@@ -262,8 +263,41 @@ describe("M6 UAT — audit-chain rewrite + anchor-binding gap", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 describe("M6 UAT — reserves false-surplus", { skip: !HAS_DB }, () => {
   let db: Db;
-  before(() => { db = createDb(process.env.DATABASE_URL as string); });
-  after(async () => { await db.close(); });
+
+  // Own, ISOLATED ledger fixture. This suite shares one Postgres with the other
+  // DB suites, so reading the GLOBAL liability / outstanding-ANT aggregate would
+  // be poisoned by their (concurrently mutating) rows — flaking the shortfall and
+  // sampled-fraction assertions. Every reserves call below is scoped to exactly
+  // these asset keys via `assetScope`, so the aggregates are deterministic.
+  const fixtureAssets: string[] = [];
+  const fixtureRecipients: string[] = [];
+  const FIXTURE_OUTSTANDING = 1_000_000n; // mARIO owed by the fixture (one token asset)
+  const FIXTURE_ANTS = 4; // outstanding ANTs in the fixture (> sampleSize below)
+
+  before(async () => {
+    db = createDb(process.env.DATABASE_URL as string);
+    const recipientId = `resv_${randomBytes(8).toString("hex")}`;
+    await insertRecipient(db.pool, {
+      recipientId, protocol: 1, sourceAddress: recipientId, recipientPubkey: new Uint8Array(randomBytes(20)),
+    });
+    const tokenKey = randomBytes(32).toString("hex");
+    await insertAsset(db.pool, recipientId, {
+      assetKey: tokenKey, assetType: "token", amount: FIXTURE_OUTSTANDING, status: "available",
+    });
+    fixtureAssets.push(tokenKey);
+    for (let i = 0; i < FIXTURE_ANTS; i++) {
+      const antKey = randomClaimant();
+      await insertAsset(db.pool, recipientId, {
+        assetKey: antKey, assetType: "ant", antMint: randomClaimant(), amount: null, status: "available",
+      });
+      fixtureAssets.push(antKey);
+    }
+    fixtureRecipients.push(recipientId);
+  });
+  after(async () => {
+    if (fixtureAssets.length) await cleanup(db.pool, fixtureAssets, fixtureRecipients);
+    await db.close();
+  });
 
   class MapGateway implements ChainGateway {
     constructor(private readonly bal: Map<string, bigint>) {}
@@ -285,6 +319,7 @@ describe("M6 UAT — reserves false-surplus", { skip: !HAS_DB }, () => {
       computeReserves({
         pool: db.pool, gateway: new MapGateway(new Map([[ata as string, B]])),
         network: "solana-mainnet", mint, hotDispenser: owner, coldReserve: owner, antCheck: { mode: "off" },
+        assetScope: fixtureAssets,
       }),
       /coldReserve owner == hotDispenser|counted twice/,
     );
@@ -293,6 +328,7 @@ describe("M6 UAT — reserves false-surplus", { skip: !HAS_DB }, () => {
     const r = await computeReserves({
       pool: db.pool, gateway: new MapGateway(new Map([[ata as string, B]])),
       network: "solana-mainnet", mint, hotDispenser: owner, coldReserve: cold, antCheck: { mode: "off" },
+      assetScope: fixtureAssets,
     });
     assert.equal(r.reserves.hotFloatMario, B.toString());
     assert.equal(r.reserves.coldReserveMario, "0"); // distinct cold ATA is empty
@@ -300,8 +336,9 @@ describe("M6 UAT — reserves false-surplus", { skip: !HAS_DB }, () => {
   });
 
   it("FIXED: a same-address config can no longer MASK a shortfall (false surplus)", async () => {
-    const liab = await readLiabilities(db.pool);
-    if (liab.outstandingMario === 0n) return; // nothing owed -> can't demonstrate
+    // Liability is read from the SCOPED fixture (deterministic == FIXTURE_OUTSTANDING).
+    const liab = await readLiabilities(db.pool, fixtureAssets);
+    assert.equal(liab.outstandingMario, FIXTURE_OUTSTANDING, "scoped fixture liability is deterministic");
     const mint = (await generateKeyPairSigner()).address;
     const owner = (await generateKeyPairSigner()).address;
     const ata = await getAssociatedTokenAddress(owner, mint);
@@ -311,23 +348,23 @@ describe("M6 UAT — reserves false-surplus", { skip: !HAS_DB }, () => {
       computeReserves({
         pool: db.pool, gateway: new MapGateway(new Map([[ata as string, B]])),
         network: "solana-mainnet", mint, hotDispenser: owner, coldReserve: owner, antCheck: { mode: "off" },
+        assetScope: fixtureAssets,
       }),
     );
     // The TRUE distinct reserve is correctly reported as a shortfall.
     const r = await computeReserves({
       pool: db.pool, gateway: new MapGateway(new Map([[ata as string, B]])),
       network: "solana-mainnet", mint, hotDispenser: owner, antCheck: { mode: "off" },
+      assetScope: fixtureAssets,
     });
     assert.equal(r.coverage.tokenVaultCovered, false, "genuine shortfall is flagged");
     assert.ok(BigInt(r.coverage.surplusMario) < 0n, "negative surplus (real shortfall)");
   });
 
   it("FIXED: ANT sampling never reports antCovered=true (sampled-only, not a coverage claim)", async () => {
-    const out = await db.pool.query<{ n: string }>(
-      "SELECT count(*)::text n FROM assets WHERE asset_type='ant' AND status NOT IN ('claimed','cancelled')",
-    );
-    const outstandingAnts = Number(out.rows[0].n);
-    if (outstandingAnts < 2) return; // need several to show a partial sample
+    // Sample fewer than the fixture's outstanding ANTs so the sample is provably
+    // partial regardless of what else is in the shared DB (aggregate is scoped).
+    const sampleSize = FIXTURE_ANTS - 1;
     const ADDR = getAddressEncoder();
     const mint = (await generateKeyPairSigner()).address;
     const authority = (await generateKeyPairSigner()).address;
@@ -340,10 +377,11 @@ describe("M6 UAT — reserves false-surplus", { skip: !HAS_DB }, () => {
     const r = await computeReserves({
       pool: db.pool, gateway: new MapGateway(new Map([[ata as string, 0n]])),
       rpc: fakeRpc, network: "solana-mainnet", mint, hotDispenser: authority, antAuthority: authority,
-      antCheck: { mode: "sample", sampleSize: 2 },
+      antCheck: { mode: "sample", sampleSize }, assetScope: fixtureAssets,
     });
     const ah = r.reserves.antHoldings as { method: string; checked: number; matchingAuthority: number; outstandingTotal: number };
     assert.equal(ah.method, "sample");
+    assert.equal(ah.outstandingTotal, FIXTURE_ANTS, "scoped outstanding count is deterministic");
     assert.ok(ah.checked < ah.outstandingTotal, "only a fraction was sampled");
     // A partial sample proves the sampled few are owned, NOT holdings >= outstanding.
     // Coverage MUST NOT read `true` under sampling.

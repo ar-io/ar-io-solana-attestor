@@ -46,10 +46,25 @@ export type FloatDenial =
   | { reason: "insufficient_float"; needMario: bigint; availableMario: bigint }
   | { reason: "exceeds_brake"; amountMario: bigint; thresholdMario: bigint };
 
+export interface FloatManagerOptions {
+  /**
+   * Restrict the in-flight `reserved()` sum to this set of asset keys. Production
+   * leaves it UNSET so the float is measured against EVERY in-flight token/vault
+   * dispatch (the correct, conservative semantics — the hot ATA is one shared
+   * pool). It exists so a caller that operates a bounded tranche of the ledger
+   * (per-batch ops), or a test that shares one Postgres with other suites, can
+   * measure the reserved draw against only its own assets and not be poisoned by
+   * unrelated in-flight rows. Empty array == "no assets" (reserved is 0).
+   */
+  reservedAssetScope?: readonly string[];
+}
+
 export class FloatManager {
   #policy: FloatPolicy;
-  constructor(policy: FloatPolicy) {
+  #reservedAssetScope?: readonly string[];
+  constructor(policy: FloatPolicy, opts: FloatManagerOptions = {}) {
     this.#policy = policy;
+    this.#reservedAssetScope = opts.reservedAssetScope;
   }
 
   get policy(): FloatPolicy {
@@ -61,16 +76,21 @@ export class FloatManager {
    * down the hot ATA but haven't confirmed yet (so the balance hasn't dropped).
    * settlement_amount (actual mARIO to move) is preferred; falls back to the
    * asset amount. ANTs contribute 0. Optionally exclude one claim (the one being
-   * evaluated) so we don't double-count it.
+   * evaluated) so we don't double-count it. When `reservedAssetScope` is set, the
+   * sum is restricted to those asset keys (see FloatManagerOptions).
    */
   async reserved(db: Pool | PoolClient, excludeClaimId?: string): Promise<bigint> {
+    // NULL scope => global (production). A non-null scope (possibly empty) filters
+    // to exactly those asset keys — an empty scope yields 0 by construction.
+    const scope = this.#reservedAssetScope ? [...this.#reservedAssetScope] : null;
     const r = await db.query<{ total: string | null }>(
       `SELECT COALESCE(SUM(COALESCE(c.settlement_amount, a.amount)), 0)::text AS total
          FROM claims c JOIN assets a ON a.asset_key = c.asset_key
         WHERE c.status IN ('verified', 'dispatching')
           AND a.asset_type IN ('token', 'vault')
-          AND ($1::uuid IS NULL OR c.claim_id <> $1::uuid)`,
-      [excludeClaimId ?? null],
+          AND ($1::uuid IS NULL OR c.claim_id <> $1::uuid)
+          AND ($2::text[] IS NULL OR a.asset_key = ANY($2::text[]))`,
+      [excludeClaimId ?? null, scope],
     );
     return BigInt(r.rows[0].total ?? "0");
   }

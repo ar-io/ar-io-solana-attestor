@@ -130,4 +130,33 @@ describe("claims HTTP routes", { skip: HAS_DB ? false : "DATABASE_URL not set" }
     assert.notEqual(other.statusCode, 429);
     await app.close();
   });
+
+  it("serves ops /metrics (Prometheus) and /metrics.json (snapshot + alerts)", async (t) => {
+    if (!usable) return t.skip("M3 schema not migrated");
+    const app = buildApp({ config: cfg(), db, limiters: createRateLimiters({ windowMs: 60_000, ipLimit: 100_000, identityLimit: 100_000 }) });
+    await app.ready();
+
+    const prom = await app.inject({ method: "GET", url: "/metrics" });
+    assert.equal(prom.statusCode, 200);
+    assert.match(prom.headers["content-type"] as string, /text\/plain/);
+    assert.match(prom.body, /^claims_up 1$/m);
+    assert.match(prom.body, /claims_dispatch_drift_mario /);
+
+    const json = await app.inject({ method: "GET", url: "/metrics.json" });
+    assert.equal(json.statusCode, 200);
+    const body = json.json();
+    assert.ok(body.claims && body.dispatch && body.liabilities, "snapshot blocks present");
+    assert.ok(Array.isArray(body.alerts), "alerts array present");
+    assert.ok(["ok", "info", "warning", "critical"].includes(body.alertLevel), `alertLevel: ${body.alertLevel}`);
+
+    // /metrics is NOT under /v1 so it isn't IP-rate-limited (scraped frequently).
+    const app2 = buildApp({ config: cfg(), db, limiters: createRateLimiters({ windowMs: 60_000, ipLimit: 1, identityLimit: 1 }) });
+    await app2.ready();
+    for (let i = 0; i < 5; i++) {
+      const r = await app2.inject({ method: "GET", url: "/metrics" });
+      assert.equal(r.statusCode, 200, "metrics never rate-limited");
+    }
+    await app2.close();
+    await app.close();
+  });
 });

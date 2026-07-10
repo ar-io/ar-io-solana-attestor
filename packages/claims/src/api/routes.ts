@@ -37,6 +37,7 @@ import {
 import { createRpc } from "../solana.js";
 import { SolanaChainGateway } from "../dispatch/chain.js";
 import { loadTransparencyConfig } from "../transparency/config.js";
+import { getMetricsPrometheus, getMetricsResult } from "./metrics.js";
 
 export interface ClaimsRoutesDeps {
   config: Config;
@@ -202,6 +203,30 @@ export function registerClaimsRoutes(app: FastifyInstance, deps: ClaimsRoutesDep
     try {
       const { rpc, gateway } = ensureReservesChain();
       reply.send(await getReserves({ pool, gateway, rpc, tconfig, network: config.network }));
+    } catch (e) {
+      sendApiError(reply, e);
+    }
+  });
+
+  // --- Ops metrics (M7) — NOT under /v1 (so it's not IP-rate-limited); serve
+  //     from the ops network / behind the reverse proxy. Public aggregate data.
+  const metricsDeps = { pool, config, tconfig, ensureChain: ensureReservesChain };
+
+  // GET /metrics — Prometheus text exposition.
+  app.get("/metrics", async (_req, reply) => {
+    try {
+      reply.header("content-type", "text/plain; version=0.0.4; charset=utf-8");
+      reply.send(await getMetricsPrometheus(metricsDeps));
+    } catch (e) {
+      sendApiError(reply, e);
+    }
+  });
+
+  // GET /metrics.json — full JSON snapshot + firing alerts + overall level.
+  app.get("/metrics.json", async (_req, reply) => {
+    try {
+      const { snapshot, alerts, alertLevel } = await getMetricsResult(metricsDeps);
+      reply.send({ ...snapshot, alertLevel, alerts });
     } catch (e) {
       sendApiError(reply, e);
     }

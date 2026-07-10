@@ -1188,3 +1188,114 @@ invoked the live memo program with the `ar.io-claim:<id>` memo landed on-chain
 Re-verify after the fixes: **attestor 11 + canonical 49 unchanged**, **claims
 356**; `build`/`typecheck`/`typecheck:tests`/`lint` clean. Both devnet proofs
 green (anchor/reserves 7/7 with `signer=true`; memo-dispatch PASS).
+
+## M7 — Ops hardening + staging rehearsal + decommission
+
+The last build milestone before the security audit. Three deliverables:
+ops/observability, the operator runbooks + decommission plan, and the full
+end-to-end staging rehearsal on devnet. Plus the test-isolation flake fix.
+
+### Test-isolation flake fix (stable green)
+
+Two DB-backed tests flaked because aggregate queries scan the WHOLE shared
+Postgres, so rows from concurrently-running test files poisoned the assertion:
+
+1. `worker.db.test.ts › insufficient float … deferred_refill` — `float.reserved()`
+   sums ALL in-flight token/vault claims globally; an unrelated file's verified
+   claims pushed available float below the refill amount → the refill step read
+   `deferred_refill` instead of `confirmed`.
+2. `adversarial.uat.test.ts › reserves` — `readLiabilities` / `sampleAntHoldings`
+   read the global outstanding count; when the shared DB happened to hold exactly
+   `sampleSize` ANTs the "partial sample" assertion flipped.
+
+**Fix (scoped queries, production semantics unchanged):** added an OPTIONAL asset-
+key scope — `FloatManager({ reservedAssetScope })` and `computeReserves({
+assetScope })` / `readLiabilities(pool, scope)` / `sampleAntHoldings(..., scope)`.
+Production omits the scope → global (correct: the hot ATA is one shared pool; the
+reserves are the whole ledger). The two suites pass their OWN seeded asset keys, so
+their aggregates are measured only against their own rows. The reserves suite also
+now seeds a deterministic isolated fixture (1 token + 4 ANTs) instead of reading
+whatever the shared DB happened to hold. **Proven** by injecting the exact
+contamination (250M ARIO of orphaned in-flight token claims + 14 outstanding ANTs)
+and re-running the two files green, plus 12× full-suite serial runs (0 fail).
+
+### Ops surface (`src/ops/` + `src/api/metrics.ts`)
+
+- **`metrics.ts`** — `collectDbMetrics(pool)` + `collectMetrics(pool, {float?,
+  reserves?})`: dispatch confirmed/failed/in-flight, reconciliation drift
+  (`Σ dispatched − Σ claimed`, must be 0), claim rate (confirmed 1h/24h, created
+  1h), error rates, the >100k/ANT review-queue depth + oldest age, dispatching
+  stall age, audit head seq + unsigned-row backlog, last-anchor age; folds in
+  live **float** + **reserves** blocks. `renderPrometheus` emits scrape text.
+- **`alerts.ts`** — pure `evaluateAlerts(snapshot, thresholds)`:
+  `reconciliation-mismatch` / `reserves-shortfall` / `dispatch-failure` (critical);
+  `float-low` / `float-over-cap` / `big-claim-queue-growing` / `-sla-breach` /
+  `dispatch-stalled` / `anchor-failure` / `anchor-unconfirmed` /
+  `audit-unsigned-backlog` (warning). Thresholds env-tunable (`ALERT_*`).
+- **`config-validation.ts`** — `assertBootConfig(env, {role})` FAILS FAST (aborts
+  boot) on: a pooled `CONFIRM_RPC_URL` (worker; the runtime guard only warns),
+  any two of the FIVE distinct keys sharing an address, NETWORK vs RPC-host
+  mismatch, a bare `*_SEED_BASE64` on mainnet, missing `ARIO_MINT`/treasury signer
+  (worker), missing explicit `DATABASE_URL` off localnet. Wired into `index.ts`
+  (API) + `cli/dispatch-worker.ts` (worker).
+- Surfaces: **`GET /metrics`** (Prometheus, not `/v1` → not rate-limited),
+  **`GET /metrics.json`** (snapshot + `alerts[]` + `alertLevel`), **`yarn
+  ops:metrics`** (structured-JSON CLI, exit 2 on critical), and the dispatch
+  worker logs firing alerts each tick.
+- Tests: `ops/config-validation.test.ts` (each documented misconfig fails fast),
+  `ops/alerts.test.ts` (each condition fires / quiet when healthy),
+  `ops/metrics.db.test.ts` (collector shape + lower-bound presence + Prometheus
+  format), `api/app.http.test.ts` (metrics endpoints served + never rate-limited).
+
+### Runbooks + decommission (`docs/claims/runbooks/`)
+
+`README` (index + observability/alert reference + the **append-only `audit_log`
+production invariant** + boot-validation), `01-deploy`, `02-key-ceremony` (the
+five distinct keys, sealed at rest), `03-hot-float-refill` (cold→hot 4-eyes),
+`04-big-claim-approval` (>100k review + AT-RISK), `05-ant-cold-batch-dispatch`
+(`dispatch:ants`, cold authority per batch, no persistent key),
+`06-transparency-cadence` (publish + anchor cadence + reserves gpa decision),
+`07-incident-response` (freeze-first; double-dispatch / key compromise / RPC-pool
+outage / anchor failure), `08-decommission` (T-30d → teardown executable
+checklist; unclaimed held-not-burned; escrow program stays as fallback).
+
+### FULL staging rehearsal (`scripts/staging-rehearsal.ts`, `yarn rehearsal:staging`)
+
+A single scripted run that stands up a **clean dedicated `claims_rehearsal` DB**
+(append-only audit_log for the transparency proofs), seeds a representative ledger
+with AR (RSA-4096) + ETH (secp256k1) identities we control, and drives the FULL
+matrix through the **real HTTP API + real DispatchWorker on-chain**, then reconcile
++ publish + anchor + reserves — each verified as a third party.
+
+**PROVEN LIVE on devnet** (QuickNode staging RPC, funded by the staging authority)
+— all 14 phases PASS:
+- 8 matrix rows: **AR-token** (tx `53Yv2tCQ…`), **ETH-token** (`3BSWkKGj…`),
+  **vault-expired→liquid**, **vault-active→relock ROUTED to operator**, **>100k**
+  (complete=`pending_review` → operator approve → confirmed, tx `48MZuezZ…`),
+  **AR-ANT** + **ETH-ANT** dispensed by a SINGLE `runAntBatch(cold)` (Owner AND
+  UpdateAuthority == claimant, read back on-chain), and the cold-batch handling
+  BOTH ANTs at once. Each: lookup → initiate → sign → complete → dispatch →
+  on-chain confirm.
+- **reconcile-dispatch** clean: 6 confirmed claims, Σ dispatched == Σ claimed =
+  158,234 ARIO, 2 ANTs.
+- **publish ledger** signed + third-party verified PINNED (unpinned refuses) +
+  membership proof.
+- **anchor audit head on-chain** (memo tx `5o2qJjyy…`, seq 32): memo read BACK
+  FROM CHAIN, `checkExtendsAnchor` = true, signer pinned to the publisher = true.
+- **reserves** covered (holdings 1,141,766 ≥ outstanding 3,000 ARIO). The vault-
+  active relock stays a liability (routed, not claimed) — correctly covered.
+
+Re-runnable (drops+recreates the rehearsal DB, fresh keys, funds ~1.5 SOL/run);
+artifacts (tx sigs + reconcile/reserves/anchor) written to `REHEARSAL_OUT`. On a
+surfpool mainnet-fork localnet it runs off airdrops (no funder).
+
+**Residuals folded from the carry-forward:** single-consistent CONFIRM_RPC and the
+append-only audit_log are now enforced/validated at boot + documented in the
+runbooks; the reserves ANT-gpa cadence + dedicated RPC is an operator decision
+documented in runbook 06; the human browser+wallet UAT, counsel sign-off, and the
+external security review remain hard cutover gates (SEC milestone).
+
+Full suite after M7: **attestor 11 + canonical 49 unchanged**, **claims 356 + M7
+additions**; `build`/`typecheck`/`typecheck:tests`/`lint` clean. Vault RE-LOCK is
+still routed-to-operator (not executed on an ad-hoc mint — the M4 caveat; the
+rehearsal proves the routing, not a live relock CPI).

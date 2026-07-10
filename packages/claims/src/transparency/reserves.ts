@@ -37,8 +37,21 @@ export interface LedgerLiabilities {
   totalAnts: number;
 }
 
+/**
+ * Optional asset-key scope. Production omits it so the liability is measured over
+ * the WHOLE ledger. A caller reporting a bounded tranche (per-batch ops) — or a
+ * test sharing one Postgres with other suites — passes an explicit set so the
+ * aggregate is measured against only its own rows and not poisoned by unrelated
+ * ones. `null`/`undefined` == whole ledger; an empty array == no assets.
+ */
+export type AssetScope = readonly string[] | null | undefined;
+
+function scopeParam(scope: AssetScope): string[] | null {
+  return scope ? [...scope] : null;
+}
+
 /** Read the outstanding ARIO + ANT liability straight from the ledger tables. */
-export async function readLiabilities(pool: Pool): Promise<LedgerLiabilities> {
+export async function readLiabilities(pool: Pool, scope?: AssetScope): Promise<LedgerLiabilities> {
   const r = await pool.query<{
     outstanding_mario: string;
     claimed_mario: string;
@@ -54,7 +67,9 @@ export async function readLiabilities(pool: Pool): Promise<LedgerLiabilities> {
        count(*) FILTER (WHERE asset_type = 'ant' AND status NOT IN ('claimed','cancelled'))::text AS outstanding_ants,
        count(*) FILTER (WHERE asset_type = 'ant' AND status = 'claimed')::text AS claimed_ants,
        count(*) FILTER (WHERE asset_type = 'ant' AND status <> 'cancelled')::text AS total_ants
-     FROM assets`,
+     FROM assets
+     WHERE ($1::text[] IS NULL OR asset_key = ANY($1::text[]))`,
+    [scopeParam(scope)],
   );
   const row = r.rows[0];
   return {
@@ -99,15 +114,21 @@ export async function sampleAntHoldings(
   rpc: Rpc<SolanaRpcApi>,
   authority: Address,
   sampleSize: number,
+  scope?: AssetScope,
 ): Promise<AntHoldingsSample> {
+  const scopeArr = scopeParam(scope);
   const r = await pool.query<{ ant_mint: string }>(
     `SELECT ant_mint FROM assets
       WHERE asset_type = 'ant' AND status NOT IN ('claimed','cancelled') AND ant_mint IS NOT NULL
+        AND ($2::text[] IS NULL OR asset_key = ANY($2::text[]))
       ORDER BY asset_key LIMIT $1`,
-    [sampleSize],
+    [sampleSize, scopeArr],
   );
   const total = await pool.query<{ n: string }>(
-    "SELECT count(*)::text AS n FROM assets WHERE asset_type = 'ant' AND status NOT IN ('claimed','cancelled')",
+    `SELECT count(*)::text AS n FROM assets
+      WHERE asset_type = 'ant' AND status NOT IN ('claimed','cancelled')
+        AND ($1::text[] IS NULL OR asset_key = ANY($1::text[]))`,
+    [scopeArr],
   );
   let matching = 0;
   let checked = 0;
@@ -196,6 +217,9 @@ export interface ReservesInput {
   antAuthority?: Address;
   /** 0 disables the ANT check; >0 samples that many; 'gpa' does a full count. */
   antCheck?: { mode: "off" } | { mode: "sample"; sampleSize: number } | { mode: "gpa" };
+  /** Restrict the LEDGER-side liability aggregate to this asset-key set (per-batch
+   *  reporting / test isolation). Omit for the whole ledger. See AssetScope. */
+  assetScope?: AssetScope;
 }
 
 /** Compute the full reserves-vs-liabilities report. */
@@ -212,7 +236,7 @@ export async function computeReserves(input: ReservesInput): Promise<ReservesRep
   const hotAta = await getAssociatedTokenAddress(input.hotDispenser, input.mint);
   const [hotFloatMario, liabilities] = await Promise.all([
     input.gateway.getTokenBalance(hotAta),
-    readLiabilities(input.pool),
+    readLiabilities(input.pool, input.assetScope),
   ]);
 
   let coldReserveMario = 0n;
@@ -229,7 +253,7 @@ export async function computeReserves(input: ReservesInput): Promise<ReservesRep
   const antAuthority = input.antAuthority ?? input.hotDispenser;
   const antCheck = input.antCheck ?? { mode: "off" };
   if (input.rpc && antCheck.mode === "sample") {
-    antHoldings = await sampleAntHoldings(input.pool, input.rpc, antAuthority, antCheck.sampleSize);
+    antHoldings = await sampleAntHoldings(input.pool, input.rpc, antAuthority, antCheck.sampleSize, input.assetScope);
   } else if (input.rpc && antCheck.mode === "gpa") {
     const count = await countCoreAssetsByOwner(input.rpc, antAuthority);
     antHoldings = { method: "count", authority: antAuthority as string, count };

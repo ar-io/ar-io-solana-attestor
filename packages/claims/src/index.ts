@@ -8,8 +8,18 @@ import { loadConfig } from "./config.js";
 import { createDb } from "./db.js";
 import { createRpc } from "./solana.js";
 import { buildApp } from "./app.js";
+import { assertBootConfig } from "./ops/config-validation.js";
 
 async function main(): Promise<void> {
+  // Fail FAST on a misconfig before binding a port or touching the DB: single-
+  // consistent CONFIRM RPC, the five distinct keys, network sanity, required env.
+  // Warnings are printed; errors throw here and abort the boot.
+  assertBootConfig(process.env, {
+    role: "api",
+    // eslint-disable-next-line no-console
+    log: (level, code, message) => console[level === "error" ? "error" : "warn"](`[boot ${level}] ${code}: ${message}`),
+  });
+
   const config = loadConfig();
   const db = createDb(config.databaseUrl);
 

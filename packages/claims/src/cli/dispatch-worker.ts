@@ -13,8 +13,21 @@ import { SolanaChainGateway } from "../dispatch/chain.js";
 import { FloatManager } from "../dispatch/float.js";
 import { DispatchWorker } from "../dispatch/worker.js";
 import { assertSingleConfirmRpc, loadDispatchConfig, loadSignerRegistry } from "../dispatch/dispatch-config.js";
+import { assertBootConfig } from "../ops/config-validation.js";
+import { collectMetrics } from "../ops/metrics.js";
+import { evaluateAlerts, loadAlertThresholds } from "../ops/alerts.js";
+import type { FloatStatus } from "../dispatch/float.js";
 
 async function main(): Promise<void> {
+  // Fail FAST on a worker misconfig (pooled CONFIRM RPC would break exactly-once;
+  // key reuse; missing treasury signer / mint). Aborts the boot on any error.
+  assertBootConfig(process.env, {
+    role: "worker",
+    log: (level, code, message) =>
+      // eslint-disable-next-line no-console
+      console[level === "error" ? "error" : "warn"](JSON.stringify({ msg: `boot ${level}`, code, detail: message })),
+  });
+
   const config = loadConfig();
   const dispatch = loadDispatchConfig(config);
   const db = createDb(config.databaseUrl);
@@ -23,6 +36,23 @@ async function main(): Promise<void> {
   const gateway = new SolanaChainGateway(createRpc(dispatch.confirmRpcUrl));
   const signers = await loadSignerRegistry();
   const float = new FloatManager(dispatch.floatPolicy);
+  const alertThresholds = loadAlertThresholds();
+
+  /** Emit every firing alert as a severity-tagged structured log line. */
+  async function emitAlerts(floatStatus: FloatStatus): Promise<void> {
+    try {
+      const snapshot = await collectMetrics(db.pool, { float: floatStatus });
+      for (const a of evaluateAlerts(snapshot, alertThresholds)) {
+        const line = JSON.stringify({ msg: "ALERT", alert: a.name, severity: a.severity, value: a.value, threshold: a.threshold, detail: a.message });
+        // eslint-disable-next-line no-console
+        if (a.severity === "critical") console.error(line);
+        else console.warn(line);
+      }
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error(JSON.stringify({ msg: "alert eval error", err: (e as Error).message }));
+    }
+  }
 
   const worker = new DispatchWorker({
     pool: db.pool,
@@ -64,6 +94,9 @@ async function main(): Promise<void> {
         // eslint-disable-next-line no-console
         console.warn(JSON.stringify({ msg: "REFILL NEEDED", available: status.availableMario.toString(), cap: status.capMario.toString() }));
       }
+      // Evaluate + emit ops alerts each tick (float-low, reconciliation drift,
+      // dispatch-failure, big-claim-queue, anchor-failure, ...).
+      await emitAlerts(status);
     } catch (e) {
       // eslint-disable-next-line no-console
       console.error(JSON.stringify({ msg: "tick error", err: (e as Error).message }));

@@ -45,7 +45,14 @@ let signers: SignerRegistry;
 
 async function makeWorker(gateway: FakeChainGateway): Promise<DispatchWorker> {
   return new DispatchWorker({
-    pool: db.pool, gateway, signers, float: new FloatManager(policy), config: testConfig(),
+    pool: db.pool, gateway, signers,
+    // TEST ISOLATION: this file shares one Postgres with the other DB suites, so
+    // the GLOBAL float `reserved()` sum would be poisoned by their in-flight
+    // token/vault claims (flaking the `deferred_refill` refill assertion). Scope
+    // the reserved sum to only THIS test's seeded assets — `seededAssets` is
+    // reset per-test in beforeEach and tracked before makeWorker in every case.
+    float: new FloatManager(policy, { reservedAssetScope: seededAssets }),
+    config: testConfig(),
     mint: MINT,
     vaultDurations: { minVaultDuration: BigInt(14 * 86_400), maxVaultDuration: BigInt(365 * 86_400) },
     antRequiresApproval: true,

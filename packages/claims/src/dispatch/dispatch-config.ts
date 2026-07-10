@@ -49,21 +49,26 @@ export function assertSingleConfirmRpc(url: string, warn: (m: string) => void = 
   }
 }
 
+/**
+ * Build the hot-float policy from env alone (no ARIO_MINT / worker deps). Shared
+ * by the worker config below and the read-only /metrics float gauge so both apply
+ * the SAME cap + refill threshold. `bigClaimThresholdMario` comes from the API
+ * config (the >100k brake).
+ */
+export function floatPolicyFromEnv(bigClaimThresholdMario: bigint, env: NodeJS.ProcessEnv = process.env): FloatPolicy {
+  // 500,000 ARIO hot-float cap by default.
+  const capMario = BigInt(env.HOT_FLOAT_CAP_MARIO ?? (500_000n * ONE_TOKEN).toString());
+  // Refill signal when available float drops below 20% of the cap (§4.3).
+  const refillThresholdMario = BigInt(env.FLOAT_REFILL_THRESHOLD_MARIO ?? (capMario / 5n).toString());
+  return { capMario, bigClaimThresholdMario, refillThresholdMario };
+}
+
 export function loadDispatchConfig(base: Config, env: NodeJS.ProcessEnv = process.env): DispatchConfig {
   if (!env.ARIO_MINT) throw new Error("ARIO_MINT is required for the dispatch worker");
   const mint = address(env.ARIO_MINT);
   const arioCoreProgram = env.ARIO_CORE_PROGRAM ? address(env.ARIO_CORE_PROGRAM) : undefined;
 
-  // 500,000 ARIO hot-float cap by default.
-  const capMario = BigInt(env.HOT_FLOAT_CAP_MARIO ?? (500_000n * ONE_TOKEN).toString());
-  // Refill signal when available float drops below 20% of the cap (§4.3).
-  const refillThresholdMario = BigInt(env.FLOAT_REFILL_THRESHOLD_MARIO ?? (capMario / 5n).toString());
-
-  const floatPolicy: FloatPolicy = {
-    capMario,
-    bigClaimThresholdMario: base.bigClaimThresholdMario,
-    refillThresholdMario,
-  };
+  const floatPolicy = floatPolicyFromEnv(base.bigClaimThresholdMario, env);
 
   // Live ArioConfig.min/max_vault_duration — the operator sources these from the
   // on-chain ArioConfig at cutover. Defaults: 14 days min, 365 days max.
