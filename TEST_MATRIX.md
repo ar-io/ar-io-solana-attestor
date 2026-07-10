@@ -115,6 +115,33 @@ Endpoint shapes, the locking strategy, and the replay/idempotency model are in
 `SPEC.md` → "M3". Full suite: **claims 199** (28 new) + attestor 11 + canonical 49
 unchanged.
 
+## M4 — dispatch + custody (money movement)
+
+Verified in `packages/claims/src/dispatch/*.test.ts` (34 unit + 15 DB) + the
+LIVE surfpool proof `scripts/m4-localnet-proof.ts`. See `SPEC.md` → "M4".
+
+| # | Scenario | Where proven | Expected |
+|---|----------|--------------|----------|
+| D1 | TOKEN dispense (SPL transfer to claimant ATA) | live surfpool + fake DB | asset `claimed`, on-chain balance == amount, ONE signature |
+| D2 | VAULT-liquid (expired) dispense | live surfpool + fake DB | SPL transfer of amount; `settlement=liquid` |
+| D3 | VAULT-relock (still locked, long remaining) | fake DB | routed to operator (never silently liquid); over-max throws |
+| D4 | ANT Owner+UA atomic transfer | live surfpool (MPL Core) + fake DB | Owner AND UpdateAuthority == claimant on-chain |
+| D5 | **Exactly-once: crash AFTER land, before finalize** | fake DB | recovery confirms; signCount stays 1 (no re-send) |
+| D6 | **Exactly-once: crash BEFORE broadcast + blockhash expiry** | fake DB | re-sign; EXACTLY ONE tx lands |
+| D7 | Idempotent re-run of a confirmed claim | live surfpool + fake DB | `already_confirmed`, balance unchanged |
+| D8 | Two concurrent workers, one claim | fake DB | single dispatch (row-lock serialized) |
+| D9 | >100k big-claim brake | live surfpool + fake DB | `routed_to_review`, NOT dispensed until approved |
+| D10 | Insufficient float | fake DB | `deferred_refill`, claim stays queued, nothing signed |
+| D11 | ANT operator-gated (never auto-hot) | live surfpool + fake DB | `awaiting_approval`; dispensed only after approve, via `ant` signer |
+| D12 | Encrypted-at-rest hot key | unit | seal/open round-trips; wrong passphrase / tamper fail closed; seed never on disk |
+| D13 | Pluggable signer | unit | EncryptedKeypairSigner default; KMS/Squads stubs conform; separable-role guard |
+| D14 | Reconcile-after-dispatch | fake DB | dispatched==claimed; catches tamper / double-dispense / missing sig+audit |
+
+Residuals: vault RE-LOCK not exercised live (needs deployed ario-core +
+ArioConfig + vault ATA); SPL Memo disabled in the surfnet proof (datasource
+wouldn't clone the Memo program; product default on, made optional so it never
+blocks a dispense). Both detailed in `SPEC.md` → "M4 caveats".
+
 ## Note on ADR-022 vs ADR-027 (vault settlement)
 
 `escrow-claim-runner.ts` currently reflects the **ADR-022** on-chain

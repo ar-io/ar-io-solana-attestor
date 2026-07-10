@@ -18,7 +18,11 @@
     "migrate:down": "node-pg-migrate down",
     "migrate:create": "node-pg-migrate create",
     "build:ledger": "tsx src/cli/build-ledger.ts",
-    "reconcile:ledger": "tsx src/cli/reconcile-ledger.ts"
+    "reconcile:ledger": "tsx src/cli/reconcile-ledger.ts",
+    "encrypt:treasury-key": "tsx src/cli/encrypt-treasury-key.ts",
+    "dispatch:worker": "tsx src/cli/dispatch-worker.ts",
+    "dispatch:approve": "tsx src/cli/approve-claim.ts",
+    "reconcile:dispatch": "tsx src/cli/reconcile-dispatch.ts"
   },
   "dependencies": {
     "@ar.io/attestor-canonical": "0.1.0",

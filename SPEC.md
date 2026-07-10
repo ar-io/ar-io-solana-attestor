@@ -746,3 +746,165 @@ manual_review=182). Then:
 - `settlement` is **provisional** (see above); the big-claim brake checks the
   per-asset amount and the recipient's available total, but the operator
   approval/dispatch flow itself is **M4**.
+
+## M4 — Dispatch + custody (the money-movement layer)
+
+Consumes M3's verified dispatch-intents (a `verified` claim = a won asset) and
+executes the on-chain transfer **idempotently and exactly-once** (pivot plan
+§4.3/§4.4). All code is in `packages/claims/src/dispatch/` + migration
+`1720000003000_dispatch.sql`; operator CLIs in `src/cli/`. `@solana/kit`
+throughout — **no `@solana/web3.js`**. Money is integer `bigint` mARIO.
+
+### Custody / signer model (pluggable)
+
+- **`DispenserSigner`** (`signer.ts`) is the pluggable interface the worker signs
+  through. Default backend **`EncryptedKeypairSigner`** decrypts a 32-byte
+  Ed25519 seed at runtime from an **AES-256-GCM sealed blob** (`crypto-box.ts`,
+  scrypt KDF) whose passphrase (KEK) is injected SEPARATELY at runtime — the
+  seed never touches disk in the clear (same operational discipline as the
+  attestor key, one at-rest layer heavier because this key moves money). Seal a
+  key with `yarn encrypt:treasury-key --generate --out <path>` (prints only the
+  address). `KmsSigner` / `SquadsSigner` are interface-only stubs — they slot in
+  with **no worker rewrite** (the worker only ever sees `DispenserSigner`).
+- **Two separable custody ROLES** (`SignerRegistry`, guarded by
+  `assertSeparableRoles` — the ANT signer MUST NOT be the hot key):
+  - `token` — the **HOT dispenser**, holds ONLY the bounded ARIO float (≤500k);
+    signs SPL transfers + vault settlements. Worst-case loss = the float.
+  - `ant` — the **ANT custody signer**, a SEPARATE key. See the ANT proposal.
+
+### ANT-custody proposal (flagged for coordinator review)
+
+The plan's baseline (bulk-move all 2,269 ANTs to the hot dispenser at cutover)
+puts every NFT in the hot key's blast radius. **This build instead implements
+the "config-toggle" alternative the plan itself offers, as the default:** ANTs
+are dispensed by a SEPARATE `ant` signer and every ANT dispatch is
+**operator-approval gated** (`antRequiresApproval`, default `true`) — an NFT is
+NEVER auto-dispensed from a hot key. A verified ANT claim routes to
+`pending_review`; an operator approves (`yarn dispatch:approve <claimId>`) and
+only then does the worker sign the `TransferV1`+`UpdateV1` with the `ant` signer.
+Because the signer is pluggable, the `ant` role is the natural home for a
+**cold / KMS / Squads-multisig** backend brought online per-batch — so the 2,269
+ANTs stay off the hot path entirely (they can remain under the cold authority,
+approved in batches, or a JIT per-claim delegation). ANT claim frequency is low,
+so the operator-in-the-loop latency is acceptable. **Coordinator decision
+needed:** confirm operator-gated-cold-ANT (this default) vs. the bulk-hot-move,
+and pick the concrete `ant` backend (cold key file / KMS / Squads).
+
+### Exactly-once dispatch (how a crash can't double-send)
+
+`worker.ts` `DispatchWorker`. A Solana signature is deterministic from
+(message + signer) and only landable while its blockhash is valid — the worker
+exploits both, WITHOUT durable nonces:
+
+1. **FRESH** (`verified` / approved `pending_review`): build + **SIGN** the tx →
+   get the deterministic signature → in ONE committed DB txn **PERSIST the
+   signature + its blockhash/lastValidBlockHeight and flip the claim to
+   `dispatching`** (re-checking state under `SELECT … FOR UPDATE` so a concurrent
+   worker/completer can't double-dispatch; a loser ABORTS and never broadcasts
+   its signed tx). Only AFTER that commit: **broadcast**, then **confirm**.
+2. **RECOVERY** (restart sees `dispatching` + a recorded sig — the "check for an
+   existing successful tx before sending" guard): `getSignatureStatuses(sig)` →
+   `confirmed` → finalize (no resend); `failed` → claim `failed`, asset stays
+   `claiming` for an operator (never auto-retried); `pending` + blockhash valid →
+   wait (a prior broadcast may land); `pending` + `lastValidBlockHeight` passed →
+   the tx is **permanently dead**, so re-sign a fresh one. A replacement is only
+   ever signed once the previous one is provably dead ⇒ **at most one signature
+   per claim ever lands.**
+
+Asset lifecycle `available → claiming → claimed`; a confirmed dispense marks the
+asset `claimed` (terminal) + the `one_live_claim_per_asset` unique index is the
+belt-and-suspenders backstop, so no second claim can win and no second dispatch
+row can exist. Confirmation only flips the asset to `claimed` (never on the
+un-confirmed broadcast).
+
+### Settlements
+
+- **Token**: idempotent `createIdempotent` ATA + plain SPL `Transfer` of the
+  exact mARIO from the hot dispenser to the claimant ATA (`instructions.ts`,
+  byte-parity unit-tested vs the mainnet-proven `claim-transfers.ts`).
+- **Vault**: recomputed LIVE at dispatch via M2 `computeVaultSettlement` against
+  `ArioConfig.min/max_vault_duration` (the operator sources these live; passed as
+  `vaultDurations`). `liquid` (expired / sub-min / early-window) → SPL transfer;
+  `relock` → treasury-signed `vaulted_transfer` (`vaultedTransferIx`, discriminator
+  + args + PDAs unit-tested). **Never silently caps an over-max lock** — an
+  over-`max_vault_duration` remaining throws; a relock is routed to the operator
+  rather than silently downgraded to liquid.
+- **ANT**: `TransferV1` (Owner) + `UpdateV1` (UpdateAuthority) atomic, via the
+  `ant` signer (ADR-013), mirroring `claim-transfers.ts::transferNft`.
+
+### Float manager (`float.ts`)
+
+Live hot-ATA balance (from chain) minus in-flight reserved (verified+dispatching
+token/vault amounts, excluding the claim under eval). Refuses a dispatch that
+would exceed available float (leaves the claim queued + raises `refillNeeded` —
+NOT a failure; operator tops up from cold). Enforces the **500k cap** (overCap
+flag) and, defensively, the **>100k per-claim brake** at dispatch time (over
+threshold + unapproved → `pending_review`, never auto-signed) — belt & suspenders
+over M3's complete-time routing.
+
+### Reconciliation-after-dispatch (`reconcile-dispatch.ts`, `yarn reconcile:dispatch`)
+
+Proves: Σ dispatched (`settlement_amount`) == Σ claimed (`asset.amount`) over
+confirmed token/vault claims; every confirmed claim recorded a tx signature;
+exactly one confirmed claim per `claimed` asset (no double-dispense) and no
+orphan settle; an audit row per dispatch transition (`claim.dispatching` +
+`claim.confirmed`). Optional `assetKeys` scope for per-batch ops reconcile.
+
+### Verification performed (M4)
+
+- **Unit (no DB, no chain): 34 tests.** crypto-box seal/open + fail-closed on
+  bad passphrase / GCM tamper; instruction byte-parity (SPL Transfer `[3,u64]`,
+  createIdempotent ATA `[1]`, MPL Core `TransferV1 [14,0]` / `UpdateV1
+  [15,0,0,1,1,pubkey]`, `vaulted_transfer` disc = `sha256("global:vaulted_transfer")[..8]`
+  + args, memo); encrypted-signer load/unlock + separable-role guard; KMS/Squads
+  stubs; float brake/insufficient/cap/refill.
+- **DB-backed exactly-once (FakeChainGateway, 10 + 5 tests):** token happy path →
+  confirmed + asset claimed + ONE signature + idempotent re-run; **crash AFTER
+  land, before finalize → recovery confirms, NO re-send (signCount stays 1)**;
+  **crash BEFORE broadcast + blockhash expiry → re-sign, EXACTLY ONE tx lands**;
+  two concurrent workers on one claim → single dispatch; >100k brake → not
+  dispensed until approved; insufficient float → queued (deferred_refill);
+  ANT operator-gated → not dispensed until approved (via the ant signer);
+  vault-liquid vs vault-relock routing. Plus reconcile CATCHES tampers
+  (dispatched≠claimed, missing sig, double-dispense, missing audit).
+- **LIVE on surfpool (mainnet-forked SVM) through the REAL `DispatchWorker` +
+  the real DB** (`scripts/m4-localnet-proof.ts`): created an ARIO SPL mint,
+  funded a 300k float, then **all six phases PASS** —
+  (1) float funded; (2) **TOKEN** dispensed to a claimant ATA (on-chain balance
+  == 1234 ARIO); (3) **idempotency** — re-run → `already_confirmed`, balance
+  unchanged; (4) **VAULT-liquid** dispensed (5000 ARIO); (5) **ANT** — minted an
+  MPL Core asset, operator-gated (`awaiting_approval`), approved, then
+  `TransferV1`+`UpdateV1` → **Owner AND UpdateAuthority both == claimant, read
+  back from the on-chain asset**; (6) **>100k brake** → `routed_to_review`,
+  balance 0. This is a full 3-asset-type on-chain dispense, not a simulation.
+- Full suite green: **attestor 11 + canonical 49 unchanged** (behavior
+  untouched), **claims 216 (no DB) / 268 (with DB)**. `build` + `typecheck` +
+  `typecheck:tests` clean. Migration `1720000003000_dispatch` up + down verified.
+
+### What I could NOT fully verify / caveats (M4)
+
+- **Vault RE-LOCK is not exercised live.** A treasury-signed `vaulted_transfer`
+  needs the deployed ario-core + genesis `ArioConfig` + a vault ATA provisioned
+  for the (yet-to-exist) vault PDA — not available on the forked surfnet. The
+  instruction encoding (discriminator + u64/i64/bool args) + the config/counter/
+  vault PDA derivations are unit-tested; the worker **routes a relock to the
+  operator** rather than silently settling it liquid. The live proof covers the
+  vault-LIQUID path (an SPL transfer, identical to what an expired on-chain vault
+  claim does).
+- **The SPL Memo ix is disabled in the surfpool proof** — the surfnet datasource
+  would not clone the Memo program (`account not found`). The memo is cosmetic
+  traceability; the worker makes it optional (`includeMemo`, default `true`) so a
+  cluster lacking the Memo program can never brick a dispense. Production keeps it
+  on. The memo bytes are trivial and not otherwise load-bearing.
+- **Live crash-kill is proven via the FakeChainGateway** (a deterministic SVM),
+  not by SIGKILL-ing a process mid-broadcast on surfpool — the fake reproduces
+  every crash point exactly (land-then-report-pending, crash-before-broadcast,
+  expiry) which a wall-clock kill cannot do deterministically. The live run
+  independently proves real on-chain idempotency (re-run → no double-send).
+- **Signers are `EncryptedKeypairSigner` / `InMemoryKeypairSigner`.** KMS/Squads
+  are interface stubs (they need a cloud/multisig dependency); the interface is
+  exercised so a real backend drops in without touching the worker.
+- The worker is **single-flight / sequential** (one process). The per-claim row
+  lock makes concurrent workers safe (proven), but horizontal scaling of the
+  float check across processes would want a distributed advisory lock — noted,
+  not needed for the cutover's claim rate.
