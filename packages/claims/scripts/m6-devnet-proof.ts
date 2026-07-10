@@ -56,7 +56,7 @@ import { keypairFromSeed } from "../src/transparency/keys.js";
 import { buildLedgerArtifact, proveMembership, verifyLedgerArtifact, verifyMembership, type LedgerLeaf } from "../src/transparency/ledger-artifact.js";
 import { getAuditHead, loadAuditRows, verifyAuditChain, checkExtendsAnchor } from "../src/transparency/audit-chain.js";
 import { computeEntryHash } from "../src/api/audit.js";
-import { submitAnchor, publisherSigner, auditHeadMemo, fetchAnchorMemo, parseAnchorMemo, LIVE_MEMO_PROGRAM } from "../src/transparency/anchor.js";
+import { submitAnchor, publisherSigner, auditHeadMemo, fetchAnchorMemo, parseAnchorMemo, anchorSignedBy, addressFromPublicKey, LIVE_MEMO_PROGRAM } from "../src/transparency/anchor.js";
 import { persistPublishedLedger, recordAnchor } from "../src/transparency/store.js";
 import { computeReserves, readLiabilities, readCoreOwner } from "../src/transparency/reserves.js";
 import { SolanaChainGateway } from "../src/dispatch/chain.js";
@@ -273,11 +273,14 @@ async function main(): Promise<void> {
     const fetched = await fetchAnchorMemo(rpc, anchor.signature, LIVE_MEMO_PROGRAM as string);
     const parsed = fetched ? parseAnchorMemo(fetched.memo) : null;
     const onChainMatches = !!parsed && parsed.kind === "audit-head" && parsed.hashHex === head.entryHashHex && parsed.ref === head.seq;
+    // MEDIUM #2: the anchor tx must be SIGNED by the KNOWN publisher/anchor key.
+    const anchorAddr = addressFromPublicKey(publisher.publicKey);
+    const signerOk = !!fetched && anchorSignedBy(fetched, anchorAddr);
     const ext = checkExtendsAnchor(suffix, parsed?.ref ?? "0", parsed?.hashHex ?? "", { auditPubkey: audit.publicKey, initialPrevHash: startPrev });
     expect(
       "phase3_anchor_onchain_extends",
-      anchor.confirmed && suffixChain.ok && onChainMatches && ext.ok,
-      `confirmed=${anchor.confirmed} suffix=${suffixChain.ok} onchain=${onChainMatches} extends=${ext.ok} memo="${fetched?.memo}"`,
+      anchor.confirmed && suffixChain.ok && onChainMatches && signerOk && ext.ok,
+      `confirmed=${anchor.confirmed} suffix=${suffixChain.ok} onchain=${onChainMatches} signer=${signerOk}(${fetched?.feePayer}) extends=${ext.ok}`,
     );
 
     // Rewrite detection: mutate a row's content + re-chain -> no longer extends.

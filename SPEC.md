@@ -1133,3 +1133,58 @@ lazily. CLIs: `yarn publish:ledger`, `yarn anchor:audit-log`, `yarn verify:trans
   RPC-disabled). The live proof exercises the `readCoreOwner` primitive; a full
   live sample against the 2,269 real ANT mints needs mainnet (they don't exist on
   devnet).
+
+### M6 — tester round-1 fixes (post-gate)
+
+The crypto passed but the tester found defects undermining third-party
+verifiability; all fixed on this branch, each with a regression in
+`transparency/adversarial.uat.test.ts` (the tester's `weakness:` tests, updated
+to assert the SECURED behavior — they now fail if the exploit is reintroduced).
+
+1. **MANDATORY publisher pin (MEDIUM #1).** `verify-transparency artifact <file>`
+   without `--publisher` printed PASS on an artifact an attacker rewrote AND
+   re-signed with their own key (pubkey swapped) — a self-consistent forgery.
+   Fix: `verifyLedgerArtifact` now carries a `pinned` flag and **returns `ok:false`
+   when no independent publisher key is supplied** (signature is only checked
+   against the PINNED key, never the artifact's embedded one; a key-swap fails
+   `pubkeyMatches`). The CLI **refuses to print PASS unpinned**, requiring
+   `--publisher` / `LEDGER_PUBLISHER_PUBKEY_HEX`, OR pinning the root from an
+   on-chain ledger-root anchor (`--ledger-anchor-sig` + `--rpc`, with an optional
+   signer check). Unpinned self-signed forgery now FAILS; the genuine artifact
+   pinned still verifies.
+2. **Anchor SIGNER pin (MEDIUM #2).** The memo BODY is forgeable — any funded key
+   can post a memo carrying a rewritten head, and the log "extends" it. Fix:
+   `fetchAnchorMemo` now returns the tx's `feePayer` + `signers`, and
+   `anchorSignedBy` requires the anchor tx to be signed by the KNOWN
+   publisher/anchor key. The verifier pins the ORIGINAL anchor txid itself
+   (`--anchor-sig`, never read from the operator DB for a trust verdict) AND the
+   signer (`--anchor-address` / `--publisher`). A fresh attacker-posted anchor is
+   rejected. Proven live: the devnet anchor proof asserts `signer=true` against
+   the pinned publisher address.
+3. **Distinct-custody guard (MEDIUM #3).** `computeReserves` now **throws if
+   `coldReserve == hotDispenser`** (the same ATA counted twice → false surplus),
+   and dedupes ATAs defensively before summing. Same-address configs can no
+   longer mask a shortfall.
+4. **ANT coverage honesty (LOW-MED #4).** `coverage.antCovered` is a boolean ONLY
+   under a full `gpa` count; under sampling it is **`"sampled-only"`** and can
+   NEVER read `true` (a partial sample proves the sampled few are owned, not
+   holdings ≥ outstanding ANTs).
+5. **Key-reuse guard (LOW #5).** `assertTransparencyKeysDistinct` +
+   `loadReservedAddresses` assert the audit + publisher keys differ from each
+   other AND from the treasury (`TREASURY_ADDRESS`) + attestor
+   (`ATTESTOR_PUBKEY_*`) addresses; wired into the publish + anchor CLIs.
+
+**HIGH — M4 memo constant (bundled fix).** `dispatch/instructions.ts`
+`MEMO_PROGRAM` was the "v2" id `MemoSq4g…`, a DEAD account on devnet AND mainnet;
+with `includeMemo` defaulting ON (`worker.ts`), a default production dispatch
+would reference a nonexistent program and FAIL. Fixed the constant to the live
+`Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo` (single source of truth, aliased by
+`anchor.ts::LIVE_MEMO_PROGRAM`). **Proven live on devnet**
+(`scripts/m6-memo-dispatch-devnet.ts`): a DEFAULT-config (memo ON) token dispense
+through the real `DispatchWorker` confirmed, delivered 1,234 ARIO, and its tx
+invoked the live memo program with the `ar.io-claim:<id>` memo landed on-chain
+(decoded from the tx — the v1 memo program doesn't log the text).
+
+Re-verify after the fixes: **attestor 11 + canonical 49 unchanged**, **claims
+356**; `build`/`typecheck`/`typecheck:tests`/`lint` clean. Both devnet proofs
+green (anchor/reserves 7/7 with `signer=true`; memo-dispatch PASS).

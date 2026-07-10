@@ -17,7 +17,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 
 import { loadConfig } from "../config.js";
 import { createDb } from "../db.js";
-import { loadTransparencyKeypair } from "../transparency/keys.js";
+import { loadTransparencyKeypair, assertTransparencyKeysDistinct, loadReservedAddresses } from "../transparency/keys.js";
 import { buildLeavesFromDb, persistPublishedLedger } from "../transparency/store.js";
 import { buildLedgerArtifact, verifyLedgerArtifact } from "../transparency/ledger-artifact.js";
 import { toHex } from "../transparency/merkle.js";
@@ -37,6 +37,8 @@ async function main(): Promise<void> {
       "no publisher key: set LEDGER_PUBLISHER_SEED_BASE64, or LEDGER_PUBLISHER_KEY_SEALED_PATH + LEDGER_PUBLISHER_KEY_PASSPHRASE",
     );
   }
+  // Key-reuse guard: the publisher must differ from the treasury + attestor keys.
+  assertTransparencyKeysDistinct([publisher], loadReservedAddresses());
 
   const out = arg("--out") ?? `ledger-artifact.${new Date().toISOString().slice(0, 10)}.json`;
   const ledgerVersion = arg("--version") ?? process.env.LEDGER_VERSION ?? new Date().toISOString();

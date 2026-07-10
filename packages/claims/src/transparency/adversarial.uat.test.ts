@@ -2,10 +2,12 @@
 //!
 //! Third-party-verifiability is the whole point, so these tests attack the
 //! artifacts as an untrusting outsider would: forge a second-preimage, re-sign a
-//! tampered ledger, rewrite the audit log, and inflate reserves. Some tests
-//! CHARACTERIZE weaknesses (named `weakness:`) — they pass by asserting the
-//! actual, exploitable behavior so the gap is captured as a regression, not
-//! silently trusted. Defects are reported in the tester verdict, not fixed here.
+//! tampered ledger, rewrite the audit log, and inflate reserves. The tests
+//! originally named `weakness:` characterized the exploits the tester found; the
+//! dev has since FIXED them (MEDIUM #1 mandatory publisher pin, MEDIUM #2 anchor
+//! signer pin, MEDIUM #3 distinct-custody guard, LOW-MED #4 sampled-only ANT
+//! coverage) and these tests (now `FIXED:`) assert the SECURED behavior — each is
+//! a regression that fails if the exploit is reintroduced.
 
 import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
@@ -39,7 +41,8 @@ import {
   type LedgerLeaf,
 } from "./ledger-artifact.js";
 import { checkExtendsAnchor, type AuditRow } from "./audit-chain.js";
-import { auditHeadMemo, parseAnchorMemo } from "./anchor.js";
+import { anchorSignedBy, auditHeadMemo, parseAnchorMemo, type FetchedAnchor } from "./anchor.js";
+import { addressFromPublicKey } from "./anchor.js";
 import { computeEntryHash, _canonicalJsonForTest as canonicalJson } from "../api/audit.js";
 import { computeReserves, readLiabilities } from "./reserves.js";
 import { getAssociatedTokenAddress } from "../dispatch/instructions.js";
@@ -137,17 +140,23 @@ describe("M6 UAT — published ledger tamper + re-sign forgery", () => {
     assert.ok(vd.issues.some((i) => i.includes("root mismatch") || i.includes("entryCount")));
   });
 
-  it("weakness: a FULLY re-signed forgery passes when the verifier does NOT pin the publisher key", () => {
+  it("FIXED: a fully re-signed forgery is REJECTED — unpinned verify never returns ok", () => {
     // Attacker rewrites leaves, recomputes the root, rebuilds the manifest and
     // signs it with THEIR OWN key, swapping publisherPubkeyHex to match.
     const evilLeaves = leaves().map((l) => (l.assetKey === "aa-token" ? { ...l, amount: "1" } : l));
     const forged = buildLedgerArtifact({ leaves: evilLeaves, network: "solana-mainnet", ledgerVersion: "uat-v1", generatedAt: "2026-07-10T00:00:00.000Z", publisher: EVIL });
-    // Unpinned (the CLI default: `verify-transparency artifact <file>` w/o --publisher): ACCEPTED.
-    assert.equal(verifyLedgerArtifact(forged).ok, true);
-    // Pinned to the REAL publisher key: rejected (signature invalid + pubkey mismatch).
+    // UNPINNED (no known-good key): MUST refuse — the forgery is self-consistent.
+    const unpinned = verifyLedgerArtifact(forged);
+    assert.equal(unpinned.ok, false, "unpinned verify must never pass a self-signed forgery");
+    assert.equal(unpinned.pinned, false);
+    assert.ok(unpinned.issues.some((i) => i.includes("UNPINNED")));
+    // PINNED to the REAL publisher key: rejected (key swap + signature invalid).
     const pinned = verifyLedgerArtifact(forged, toHex(PUB.publicKey));
     assert.equal(pinned.ok, false);
+    assert.equal(pinned.pubkeyMatches, false);
     assert.equal(pinned.signatureValid, false);
+    // And the GENUINE artifact, pinned, still verifies.
+    assert.equal(verifyLedgerArtifact(build(), toHex(PUB.publicKey)).ok, true);
   });
 });
 
@@ -216,10 +225,12 @@ describe("M6 UAT — audit-chain rewrite + anchor-binding gap", () => {
     assert.equal(ext.hashMatches, false);
   });
 
-  it("weakness: a rewritten log EXTENDS a freshly-forged memo — the verifier never checks the on-chain signer", () => {
+  it("FIXED: a freshly-forged anchor is caught — the verifier pins the on-chain SIGNER", () => {
     // Anchor memo content is fully attacker-controllable (any funded key can post
-    // it). An operator rewrites history, then posts a NEW memo carrying the
-    // rewritten head; parseAnchorMemo happily yields it and the log "extends" it.
+    // it). An operator rewrites history and posts a NEW memo carrying the rewritten
+    // head. The memo parses and the log "extends" it (the raw primitive) — but the
+    // SECURE verifier requires the anchor tx to be SIGNED by the KNOWN publisher/
+    // anchor key, which the attacker's memo tx is not.
     const rows = chain(6);
     let prev: Buffer = Buffer.alloc(32);
     for (let i = 0; i < rows.length; i++) {
@@ -232,10 +243,19 @@ describe("M6 UAT — audit-chain rewrite + anchor-binding gap", () => {
     const forgedMemo = auditHeadMemo(rows[5].seq, rows[5].entryHash.toString("hex"), "solana-mainnet");
     const parsed = parseAnchorMemo(forgedMemo);
     assert.ok(parsed && parsed.kind === "audit-head");
-    const ext = checkExtendsAnchor(rows, parsed.ref, parsed.hashHex, AUDIT.publicKey);
-    // The rewritten log DOES "extend" the forged anchor -> on-chain immutability
-    // only helps if the third party pins the ORIGINAL txid/slot AND the signer.
-    assert.equal(ext.ok, true);
+    const extPrimitive = checkExtendsAnchor(rows, parsed.ref, parsed.hashHex, AUDIT.publicKey);
+    assert.equal(extPrimitive.ok, true, "the raw extends-primitive still matches (memo body is forgeable)");
+
+    // The DEFENSE: the verifier pins the KNOWN publisher/anchor address. An anchor
+    // tx posted by an ATTACKER key fails the signer check -> forgery rejected.
+    const operatorAnchorAddr = addressFromPublicKey(keypairFromSeed("publisher", new Uint8Array(32).fill(11)).publicKey);
+    const attackerAnchorAddr = addressFromPublicKey(EVIL.publicKey);
+    const attackerAnchorTx: FetchedAnchor = { memo: forgedMemo, slot: 1n, err: null, feePayer: attackerAnchorAddr, signers: [attackerAnchorAddr] };
+    assert.equal(anchorSignedBy(attackerAnchorTx, operatorAnchorAddr), false, "attacker-posted anchor rejected by signer pin");
+
+    // A genuine anchor posted by the operator key passes the signer pin.
+    const genuineAnchorTx: FetchedAnchor = { memo: forgedMemo, slot: 1n, err: null, feePayer: operatorAnchorAddr, signers: [operatorAnchorAddr] };
+    assert.equal(anchorSignedBy(genuineAnchorTx, operatorAnchorAddr), true);
   });
 });
 
@@ -255,40 +275,54 @@ describe("M6 UAT — reserves false-surplus", { skip: !HAS_DB }, () => {
     async confirmSignature(): Promise<"confirmed"> { return "confirmed"; }
   }
 
-  it("weakness: cold reserve owner == hot dispenser owner DOUBLE-COUNTS the same balance", async () => {
+  it("FIXED: cold reserve owner == hot dispenser owner is REJECTED (no double-count)", async () => {
     const mint = (await generateKeyPairSigner()).address;
     const owner = (await generateKeyPairSigner()).address; // one owner used as BOTH hot + cold
     const ata = await getAssociatedTokenAddress(owner, mint);
     const B = 1_000_000_000_000n;
+    // The distinct-custody guard refuses to sum the same account twice.
+    await assert.rejects(
+      computeReserves({
+        pool: db.pool, gateway: new MapGateway(new Map([[ata as string, B]])),
+        network: "solana-mainnet", mint, hotDispenser: owner, coldReserve: owner, antCheck: { mode: "off" },
+      }),
+      /coldReserve owner == hotDispenser|counted twice/,
+    );
+    // With DISTINCT owners the same physical B is counted once (hot only).
+    const cold = (await generateKeyPairSigner()).address;
     const r = await computeReserves({
       pool: db.pool, gateway: new MapGateway(new Map([[ata as string, B]])),
-      network: "solana-mainnet", mint, hotDispenser: owner, coldReserve: owner, antCheck: { mode: "off" },
+      network: "solana-mainnet", mint, hotDispenser: owner, coldReserve: cold, antCheck: { mode: "off" },
     });
-    // The SAME on-chain balance is reported as both hot float AND cold reserve.
     assert.equal(r.reserves.hotFloatMario, B.toString());
-    assert.equal(r.reserves.coldReserveMario, B.toString());
-    assert.equal(r.reserves.totalReserveMario, (2n * B).toString()); // 2x — no distinct-address guard
+    assert.equal(r.reserves.coldReserveMario, "0"); // distinct cold ATA is empty
+    assert.equal(r.reserves.totalReserveMario, B.toString()); // counted ONCE
   });
 
-  it("weakness: the double-count MASKS a real shortfall (false surplus)", async () => {
+  it("FIXED: a same-address config can no longer MASK a shortfall (false surplus)", async () => {
     const liab = await readLiabilities(db.pool);
     if (liab.outstandingMario === 0n) return; // nothing owed -> can't demonstrate
     const mint = (await generateKeyPairSigner()).address;
     const owner = (await generateKeyPairSigner()).address;
     const ata = await getAssociatedTokenAddress(owner, mint);
-    // Hold ONE mARIO short of the liability in a single account; point cold=hot.
-    const B = liab.outstandingMario - 1n;
+    const B = liab.outstandingMario - 1n; // one mARIO short
+    // The exploit (cold=hot to double B over the liability) is now rejected.
+    await assert.rejects(
+      computeReserves({
+        pool: db.pool, gateway: new MapGateway(new Map([[ata as string, B]])),
+        network: "solana-mainnet", mint, hotDispenser: owner, coldReserve: owner, antCheck: { mode: "off" },
+      }),
+    );
+    // The TRUE distinct reserve is correctly reported as a shortfall.
     const r = await computeReserves({
       pool: db.pool, gateway: new MapGateway(new Map([[ata as string, B]])),
-      network: "solana-mainnet", mint, hotDispenser: owner, coldReserve: owner, antCheck: { mode: "off" },
+      network: "solana-mainnet", mint, hotDispenser: owner, antCheck: { mode: "off" },
     });
-    // TRUE distinct reserve (B) is a shortfall; the doubled figure reports covered.
-    assert.ok(B < liab.outstandingMario, "single account is genuinely short");
-    assert.equal(r.coverage.tokenVaultCovered, true, "double-count falsely reports covered");
-    assert.ok(BigInt(r.coverage.surplusMario) > 0n, "false surplus");
+    assert.equal(r.coverage.tokenVaultCovered, false, "genuine shortfall is flagged");
+    assert.ok(BigInt(r.coverage.surplusMario) < 0n, "negative surplus (real shortfall)");
   });
 
-  it("weakness: ANT sampling reports antCovered=true without proving count >= outstanding ANTs", async () => {
+  it("FIXED: ANT sampling never reports antCovered=true (sampled-only, not a coverage claim)", async () => {
     const out = await db.pool.query<{ n: string }>(
       "SELECT count(*)::text n FROM assets WHERE asset_type='ant' AND status NOT IN ('claimed','cancelled')",
     );
@@ -311,7 +345,9 @@ describe("M6 UAT — reserves false-surplus", { skip: !HAS_DB }, () => {
     const ah = r.reserves.antHoldings as { method: string; checked: number; matchingAuthority: number; outstandingTotal: number };
     assert.equal(ah.method, "sample");
     assert.ok(ah.checked < ah.outstandingTotal, "only a fraction was sampled");
-    // Coverage says ANTs are covered even though only 2 of thousands were checked.
-    assert.equal(r.coverage.antCovered, true);
+    // A partial sample proves the sampled few are owned, NOT holdings >= outstanding.
+    // Coverage MUST NOT read `true` under sampling.
+    assert.notEqual(r.coverage.antCovered, true);
+    assert.equal(r.coverage.antCovered, "sampled-only");
   });
 });

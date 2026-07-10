@@ -27,7 +27,12 @@ export const SYSTEM_PROGRAM = "11111111111111111111111111111111" as Address;
 export const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" as Address;
 export const ASSOCIATED_TOKEN_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL" as Address;
 export const MPL_CORE_PROGRAM = "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d" as Address;
-export const MEMO_PROGRAM = "MemoSq4gq4qMz6H4dS7YEG2KDsF7hCkQqRr5dW5CtBc" as Address;
+// SPL Memo program. This is the id ACTUALLY DEPLOYED on devnet AND mainnet
+// (getAccountInfo -> executable, verified live). The commonly-cited "v2" id
+// `MemoSq4gq4qMz6H4dS7YEG2KDsF7hCkQqRr5dW5CtBc` resolves to NO account on either
+// cluster, so a dispatch memo referencing it fails (`ProgramAccountNotFound`).
+// includeMemo defaults ON, so this MUST be the live program. See SPEC.md "M6".
+export const MEMO_PROGRAM = "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo" as Address;
 
 const addressEncoder = getAddressEncoder();
 const u64 = getU64Encoder();

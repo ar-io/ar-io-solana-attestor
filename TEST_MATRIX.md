@@ -163,8 +163,21 @@ blocks a dispense). Both detailed in `SPEC.md` → "M4 caveats".
 | T12 | Live ANT-owner read | live devnet | `readCoreOwner` == authority for an on-chain MPL Core asset |
 | T13 | Endpoints wired | DB (inject) | `/v1/transparency/{ledger,ledger/proof,log,anchors,reserves}` reachable + shaped |
 
+### M6 tester round-1 fixes (adversarial regressions now assert SECURED behavior)
+
+| # | Defect | Fix | Regression |
+|---|--------|-----|-----------|
+| MED-1 | unpinned `verify artifact` passed a re-signed forgery | publisher pin MANDATORY (`verifyLedgerArtifact.pinned`; CLI refuses PASS unpinned) | unpinned forgery → FAIL; pinned genuine → PASS |
+| MED-2 | rewritten log "extends" a fresh forged memo | verify anchor tx SIGNER (`fetchAnchorMemo` signers + `anchorSignedBy`); verifier pins original txid | attacker-posted anchor rejected; devnet `signer=true` |
+| MED-3 | cold==hot double-counts reserves (false surplus) | `computeReserves` throws on same-address + dedupes ATAs | same-address config REJECTED; genuine shortfall flagged |
+| MED-4 | `antCovered=true` from a 2-of-N sample | boolean only under `gpa`; sampling → `"sampled-only"` | sampling never `true` |
+| LOW-5 | key-reuse only by env convention | `assertTransparencyKeysDistinct` vs treasury+attestor | guard throws on reuse |
+| HIGH | `MEMO_PROGRAM` v2 id DEAD on devnet+mainnet; memo default ON → dispatch fails | constant → live `Memo1Uhk…` | default-memo dispatch confirmed live (memo lands) |
+
 Live devnet proof: `scripts/m6-devnet-proof.ts` — 7/7 phases PASS (anchor tx
-`3aik6XKT…`, slot 475288747). Residuals: anchored on devnet not mainnet;
+`5aZQ63uv…`, `signer=true`); `scripts/m6-memo-dispatch-devnet.ts` — default-memo
+dispatch confirmed (tx `2AyBGS7T…`, live memo invoked + `ar.io-claim:<id>` landed).
+Residuals: anchored on devnet not mainnet;
 Arweave data-item anchoring is a documented "and/or" extension (Solana memo
 implemented); the `MEMO_PROGRAM` constant in `dispatch/instructions.ts` (v2 id)
 is DEAD on devnet+mainnet — anchoring uses the live `Memo1Uhk…` program (M4

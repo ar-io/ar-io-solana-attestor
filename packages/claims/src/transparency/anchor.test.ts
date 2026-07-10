@@ -6,6 +6,7 @@ import { AccountRole, type Address } from "@solana/kit";
 
 import {
   LIVE_MEMO_PROGRAM,
+  anchorSignedBy,
   auditHeadMemo,
   ledgerRootMemo,
   memoIx,
@@ -47,8 +48,24 @@ describe("anchor: memo instruction", () => {
     assert.deepEqual([...(ix.data ?? [])], [...new TextEncoder().encode(memo)]);
   });
 
-  it("the live memo program differs from the (non-existent) v2 id in instructions.ts", async () => {
+  it("anchor + dispatch share ONE live memo program (the v2 id was dead on both clusters)", async () => {
     const { MEMO_PROGRAM } = await import("../dispatch/instructions.js");
-    assert.notEqual(LIVE_MEMO_PROGRAM as string, MEMO_PROGRAM as string);
+    // Single source of truth — they must AGREE, and it must be the live program
+    // (`Memo1Uhk…`), NOT the dead `MemoSq4g…` v2 id.
+    assert.equal(LIVE_MEMO_PROGRAM as string, MEMO_PROGRAM as string);
+    assert.equal(LIVE_MEMO_PROGRAM as string, "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo");
+  });
+});
+
+describe("anchor: signer verification (MEDIUM #2 — memo body is forgeable)", () => {
+  it("anchorSignedBy accepts the pinned signer and rejects an attacker's key", () => {
+    const operator = "Hk6RfBp4FpvF2hYBmJ9kqyL5dE3xR8wPzN7sV6cTqL2A";
+    const attacker = "4Yk9HoDSfJv9QcmJbLcXdWVgS7nfvdUqiVcvbSu8VBru";
+    const asOperator = { memo: "x", slot: 1n, err: null, feePayer: operator, signers: [operator] };
+    const asAttacker = { memo: "x", slot: 1n, err: null, feePayer: attacker, signers: [attacker] };
+    assert.equal(anchorSignedBy(asOperator, operator), true);
+    // A rewritten-history memo posted by ANY funded key does NOT satisfy the
+    // signer pin -> the forged anchor is rejected.
+    assert.equal(anchorSignedBy(asAttacker, operator), false);
   });
 });

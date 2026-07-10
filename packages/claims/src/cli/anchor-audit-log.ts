@@ -19,7 +19,7 @@
 
 import { loadConfig } from "../config.js";
 import { createDb } from "../db.js";
-import { loadTransparencyKeypair, assertTransparencyKeysSeparable } from "../transparency/keys.js";
+import { loadTransparencyKeypair, assertTransparencyKeysSeparable, assertTransparencyKeysDistinct, loadReservedAddresses } from "../transparency/keys.js";
 import { loadTransparencyConfig } from "../transparency/config.js";
 import {
   getAuditHead,
@@ -44,7 +44,13 @@ async function main(): Promise<void> {
   if (!publisher && !dryRun) {
     throw new Error("no publisher/anchor key: set LEDGER_PUBLISHER_SEED_BASE64 (or the sealed pair)");
   }
-  if (publisher) assertTransparencyKeysSeparable(audit, publisher);
+  const reserved = loadReservedAddresses();
+  if (publisher) {
+    assertTransparencyKeysSeparable(audit, publisher);
+    assertTransparencyKeysDistinct([audit, publisher], reserved);
+  } else {
+    assertTransparencyKeysDistinct([audit], reserved);
+  }
 
   const db = createDb(config.databaseUrl);
   try {

@@ -173,8 +173,13 @@ export interface ReservesReport {
     tokenVaultCovered: boolean;
     /** totalReserve - outstanding (mARIO; negative => shortfall). */
     surplusMario: string;
-    /** null when ANT holdings were not sampled/counted. */
-    antCovered: boolean | null;
+    /**
+     * ANT coverage. A boolean ONLY under a full `gpa` count; under sampling it is
+     * "sampled-only" (a partial sample proves the sampled few are owned, NOT that
+     * holdings >= outstanding ANTs — it must NEVER read `true`); null when ANTs
+     * were not checked.
+     */
+    antCovered: boolean | "sampled-only" | null;
   };
 }
 
@@ -195,6 +200,15 @@ export interface ReservesInput {
 
 /** Compute the full reserves-vs-liabilities report. */
 export async function computeReserves(input: ReservesInput): Promise<ReservesReport> {
+  // Distinct-custody guard (mirrors keys.ts separation guards): summing the same
+  // account as both hot float AND cold reserve DOUBLE-COUNTS one balance and can
+  // report a false surplus that masks a real shortfall. Reject the misconfig.
+  if (input.coldReserve && (input.coldReserve as string) === (input.hotDispenser as string)) {
+    throw new Error(
+      "reserves misconfig: coldReserve owner == hotDispenser — the same custody would be counted twice (false surplus). Use distinct addresses.",
+    );
+  }
+
   const hotAta = await getAssociatedTokenAddress(input.hotDispenser, input.mint);
   const [hotFloatMario, liabilities] = await Promise.all([
     input.gateway.getTokenBalance(hotAta),
@@ -204,7 +218,10 @@ export async function computeReserves(input: ReservesInput): Promise<ReservesRep
   let coldReserveMario = 0n;
   if (input.coldReserve) {
     const coldAta = await getAssociatedTokenAddress(input.coldReserve, input.mint);
-    coldReserveMario = await input.gateway.getTokenBalance(coldAta);
+    // Defensive ATA dedupe: never add the hot ATA's balance a second time.
+    if ((coldAta as string) !== (hotAta as string)) {
+      coldReserveMario = await input.gateway.getTokenBalance(coldAta);
+    }
   }
   const totalReserveMario = hotFloatMario + coldReserveMario;
 
@@ -219,10 +236,12 @@ export async function computeReserves(input: ReservesInput): Promise<ReservesRep
   }
 
   const surplus = totalReserveMario - liabilities.outstandingMario;
-  let antCovered: boolean | null = null;
+  // ANT coverage may ONLY be asserted from a FULL count. A sample proves the
+  // sampled few are owned, not that holdings >= outstanding ANTs -> "sampled-only".
+  let antCovered: boolean | "sampled-only" | null = null;
   if (antHoldings) {
     if (antHoldings.method === "count") antCovered = antHoldings.count >= liabilities.outstandingAnts;
-    else if (antHoldings.checked > 0) antCovered = antHoldings.matchingAuthority === antHoldings.checked;
+    else antCovered = "sampled-only";
   }
 
   return {

@@ -20,6 +20,7 @@
 
 import { readFileSync } from "node:fs";
 import { Buffer } from "node:buffer";
+import bs58 from "bs58";
 import * as ed25519 from "@noble/ed25519";
 import { sha512 } from "@noble/hashes/sha2";
 
@@ -94,6 +95,24 @@ export function loadTransparencyKeypair(
   return seed ? keypairFromSeed(role, seed) : undefined;
 }
 
+/**
+ * The treasury + attestor addresses the transparency keys must NOT reuse, sourced
+ * from whatever env exposes (best-effort; only PUBLIC data): TREASURY_ADDRESS and
+ * the attestor pubkey (hex or base58). Used by `assertTransparencyKeysDistinct`.
+ */
+export function loadReservedAddresses(env: NodeJS.ProcessEnv = process.env): { label: string; address: string }[] {
+  const out: { label: string; address: string }[] = [];
+  if (env.TREASURY_ADDRESS) out.push({ label: "treasury", address: env.TREASURY_ADDRESS });
+  if (env.ATTESTOR_PUBKEY_BASE58) out.push({ label: "attestor", address: env.ATTESTOR_PUBKEY_BASE58 });
+  else if (env.ATTESTOR_PUBKEY_HEX) out.push({ label: "attestor", address: bs58.encode(Buffer.from(env.ATTESTOR_PUBKEY_HEX, "hex")) });
+  return out;
+}
+
+/** base58 Solana address of a transparency key. */
+export function transparencyAddress(kp: TransparencyKeypair): string {
+  return bs58.encode(kp.publicKey);
+}
+
 /** Guard: the two transparency keys must be distinct from each other. */
 export function assertTransparencyKeysSeparable(
   audit: TransparencyKeypair,
@@ -101,5 +120,30 @@ export function assertTransparencyKeysSeparable(
 ): void {
   if (Buffer.from(audit.publicKey).equals(Buffer.from(publisher.publicKey))) {
     throw new Error("audit key and publisher key must be different Ed25519 keys");
+  }
+}
+
+/**
+ * Guard: every transparency key MUST be distinct from each other AND from the
+ * treasury + attestor keys (separable blast radii — BUILD.md). Today the
+ * separation is env-prefix convention only; this enforces it by comparing the
+ * derived Solana addresses. `reserved` carries the treasury dispenser + attestor
+ * addresses (base58) when known (the CLIs pass what env exposes).
+ */
+export function assertTransparencyKeysDistinct(
+  keys: TransparencyKeypair[],
+  reserved: { label: string; address: string }[] = [],
+): void {
+  const seen = new Map<string, string>();
+  for (const r of reserved) if (r.address) seen.set(r.address, r.label);
+  for (const k of keys) {
+    const addr = transparencyAddress(k);
+    const clash = seen.get(addr);
+    if (clash) {
+      throw new Error(
+        `transparency ${k.role} key reuses the ${clash} key (${addr}); the audit + publisher keys must be separate from the treasury and attestor keys`,
+      );
+    }
+    seen.set(addr, `transparency:${k.role}`);
   }
 }

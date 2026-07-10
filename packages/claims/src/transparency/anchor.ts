@@ -29,9 +29,14 @@ import {
 } from "@solana/kit";
 
 import { SolanaChainGateway, type ChainGateway } from "../dispatch/chain.js";
+import { MEMO_PROGRAM } from "../dispatch/instructions.js";
 
-/** The SPL Memo program actually deployed on devnet + mainnet (verified live). */
-export const LIVE_MEMO_PROGRAM = "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo" as Address;
+/**
+ * The SPL Memo program actually deployed on devnet + mainnet (verified live).
+ * Single source of truth with the dispatch worker's memo program (they must
+ * agree — the M4 "v2" id was dead on both clusters).
+ */
+export const LIVE_MEMO_PROGRAM = MEMO_PROGRAM;
 
 export type AnchorKind = "audit-head" | "ledger-root";
 
@@ -134,16 +139,28 @@ export async function anchorMemoWithRpc(opts: {
   });
 }
 
+export interface FetchedAnchor {
+  memo: string;
+  slot: bigint;
+  err: unknown;
+  /** Fee payer of the anchor tx (accountKeys[0]) — the key that authorized it. */
+  feePayer: string;
+  /** All required signers of the anchor tx (first numRequiredSignatures keys). */
+  signers: string[];
+}
+
 /**
  * Read an anchor memo back FROM CHAIN by signature — the verifier does NOT trust
  * the operator's DB. Decodes the Memo instruction's data (utf-8) from the
- * confirmed transaction, falling back to the program's log line.
+ * confirmed transaction, and returns the tx's fee payer + signers so the verifier
+ * can confirm the anchor was authorized by the KNOWN publisher/anchor key (memo
+ * content alone is forgeable by any funded key — see `anchorSignedBy`).
  */
 export async function fetchAnchorMemo(
   rpc: Rpc<SolanaRpcApi>,
   signature: string,
   memoProgram: string = LIVE_MEMO_PROGRAM as string,
-): Promise<{ memo: string; slot: bigint; err: unknown } | null> {
+): Promise<FetchedAnchor | null> {
   // Cast: kit's getTransaction typing is deep; we read a stable subset.
   const res = (await (rpc as unknown as {
     getTransaction: (
@@ -163,6 +180,7 @@ export async function fetchAnchorMemo(
         transaction: {
           message: {
             accountKeys: string[];
+            header?: { numRequiredSignatures: number };
             instructions: { programIdIndex: number; data: string }[];
           };
         };
@@ -171,16 +189,36 @@ export async function fetchAnchorMemo(
 
   if (!res) return null;
   const { message } = res.transaction;
+  const numSigners = message.header?.numRequiredSignatures ?? 1;
+  const signers = message.accountKeys.slice(0, numSigners);
+  const feePayer = message.accountKeys[0];
+  const base = { slot: res.slot, err: res.meta?.err ?? null, feePayer, signers };
   for (const ix of message.instructions) {
     if (message.accountKeys[ix.programIdIndex] === memoProgram) {
       const bytes = bs58.decode(ix.data);
-      return { memo: new TextDecoder().decode(bytes), slot: res.slot, err: res.meta?.err ?? null };
+      return { memo: new TextDecoder().decode(bytes), ...base };
     }
   }
   // Fallback: scan the program logs for the memo text.
   for (const line of res.meta?.logMessages ?? []) {
     const m = line.match(/Memo \(len \d+\): "(.*)"$/);
-    if (m) return { memo: m[1], slot: res.slot, err: res.meta?.err ?? null };
+    if (m) return { memo: m[1], ...base };
   }
   return null;
+}
+
+/**
+ * Confirm an anchor tx was authorized by the KNOWN publisher/anchor key. The memo
+ * BODY is attacker-controllable (any funded key can post a memo carrying a
+ * rewritten head), so the ONLY thing that binds an anchor to the operator is the
+ * on-chain SIGNER. A third-party verifier pins the expected anchor address (the
+ * base58 of the published publisher key) and requires it to have signed the tx.
+ */
+export function anchorSignedBy(fetched: FetchedAnchor, expectedAnchorAddress: string): boolean {
+  return fetched.signers.includes(expectedAnchorAddress) || fetched.feePayer === expectedAnchorAddress;
+}
+
+/** base58 Solana address of an Ed25519 public key (the anchor/publisher address). */
+export function addressFromPublicKey(publicKey: Uint8Array): string {
+  return bs58.encode(publicKey);
 }

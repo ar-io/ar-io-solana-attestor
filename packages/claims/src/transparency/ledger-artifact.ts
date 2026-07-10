@@ -167,8 +167,12 @@ export function buildLedgerArtifact(input: BuildArtifactInput): LedgerArtifact {
 
 export interface ArtifactVerification {
   ok: boolean;
+  /** Was an INDEPENDENT publisher key supplied? Without it, `ok` is always false. */
+  pinned: boolean;
   rootMatches: boolean;
   signatureValid: boolean;
+  /** The embedded publisher pubkey equals the pinned (known-good) one. */
+  pubkeyMatches: boolean;
   countMatches: boolean;
   digestMatches: boolean;
   recomputedRootHex: string;
@@ -178,9 +182,14 @@ export interface ArtifactVerification {
 /**
  * Independently verify an artifact: recompute the root + whole-set digest from
  * the leaves, confirm they match the manifest, and verify the publisher
- * signature over the manifest. `expectedPublisherPubkeyHex` pins the key so a
- * verifier does not trust the pubkey embedded in the (potentially swapped)
- * artifact.
+ * signature over the manifest AGAINST A PINNED KEY.
+ *
+ * SECURITY: `expectedPublisherPubkeyHex` is MANDATORY for a trusted verdict. An
+ * attacker who rewrites the leaves can recompute the root, rebuild the manifest,
+ * sign it with THEIR OWN key, and swap `publisherPubkeyHex` to match — a
+ * self-consistent forgery. So without an independent pinned key we CANNOT return
+ * `ok: true` (that would pass the forgery). When unpinned, `ok = false` and the
+ * caller is told to supply the known-good publisher key.
  */
 export function verifyLedgerArtifact(
   artifact: LedgerArtifact,
@@ -198,18 +207,29 @@ export function verifyLedgerArtifact(
   const countMatches = artifact.leaves.length === artifact.manifest.entryCount;
   if (!countMatches) issues.push(`entryCount ${artifact.manifest.entryCount} != leaves ${artifact.leaves.length}`);
 
-  const pubHex = (expectedPublisherPubkeyHex ?? artifact.publisherPubkeyHex).toLowerCase();
-  if (expectedPublisherPubkeyHex && pubHex !== artifact.publisherPubkeyHex.toLowerCase()) {
-    issues.push("artifact publisher pubkey != expected publisher pubkey");
+  const pinned = expectedPublisherPubkeyHex !== undefined && expectedPublisherPubkeyHex !== "";
+  if (!pinned) {
+    issues.push(
+      "UNPINNED: no known-good publisher key supplied. A self-signed forgery would pass — supply the published/anchored publisher pubkey to verify.",
+    );
   }
+
+  // Verify the signature against the PINNED key (never the artifact's embedded
+  // one, which an attacker controls). Unpinned -> no trust anchor, cannot verify.
+  const pubHex = (expectedPublisherPubkeyHex ?? artifact.publisherPubkeyHex).toLowerCase();
+  const pubkeyMatches = pinned && pubHex === artifact.publisherPubkeyHex.toLowerCase();
+  if (pinned && !pubkeyMatches) issues.push("artifact publisher pubkey != pinned publisher pubkey (key swapped)");
+
   const manifestBytes = new TextEncoder().encode(canonicalJson(artifact.manifest));
-  const signatureValid = verifyEd25519(manifestBytes, fromHex(artifact.signatureHex), fromHex(pubHex));
-  if (!signatureValid) issues.push("publisher signature invalid over manifest");
+  const signatureValid = pinned && verifyEd25519(manifestBytes, fromHex(artifact.signatureHex), fromHex(pubHex));
+  if (pinned && !signatureValid) issues.push("publisher signature invalid over manifest");
 
   return {
-    ok: rootMatches && signatureValid && countMatches && digestMatches && (!expectedPublisherPubkeyHex || pubHex === artifact.publisherPubkeyHex.toLowerCase()),
+    ok: pinned && rootMatches && signatureValid && pubkeyMatches && countMatches && digestMatches,
+    pinned,
     rootMatches,
     signatureValid,
+    pubkeyMatches,
     countMatches,
     digestMatches,
     recomputedRootHex: rootHex,
