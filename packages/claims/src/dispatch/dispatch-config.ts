@@ -26,6 +26,27 @@ export interface DispatchConfig {
   vaultDurations: VaultDurations;
   antRequiresApproval: boolean;
   pollIntervalMs: number;
+  /**
+   * The RPC endpoint used for the exactly-once confirmation reads
+   * (getSignatureStatuses + getBlockHeight). MUST be a SINGLE consistent
+   * endpoint (or a read quorum), NOT a round-robin/load-balanced pool — a
+   * lagging replica can report a landed tx as not-found and break the
+   * "provably dead" expiry premise (see chain.ts + SPEC.md "M4 — operational
+   * requirements"). Defaults to CONFIRM_RPC_URL, then SOLANA_RPC_URL.
+   */
+  confirmRpcUrl: string;
+}
+
+/** Heuristic warn if the confirm RPC looks like a multi-endpoint pool. */
+export function assertSingleConfirmRpc(url: string, warn: (m: string) => void = (m) => console.warn(m)): void {
+  const looksPooled = url.includes(",") || /(^|[^a-z])(lb|pool|round[-_]?robin)([^a-z]|$)/i.test(url);
+  if (looksPooled) {
+    warn(
+      `[dispatch] WARNING: CONFIRM RPC "${url}" looks like a load-balanced/multi-endpoint pool. ` +
+        `Exactly-once confirmation reads REQUIRE a single consistent endpoint (or read quorum). ` +
+        `A lagging replica can misclassify a landed tx as dead. See SPEC.md "M4 — operational requirements".`,
+    );
+  }
 }
 
 export function loadDispatchConfig(base: Config, env: NodeJS.ProcessEnv = process.env): DispatchConfig {
@@ -51,6 +72,8 @@ export function loadDispatchConfig(base: Config, env: NodeJS.ProcessEnv = proces
     maxVaultDuration: BigInt(env.VAULT_MAX_DURATION_SECONDS ?? (365 * 86_400).toString()),
   };
 
+  const confirmRpcUrl = env.CONFIRM_RPC_URL ?? env.SOLANA_RPC_URL ?? "http://127.0.0.1:8899";
+
   return {
     mint,
     arioCoreProgram,
@@ -58,6 +81,7 @@ export function loadDispatchConfig(base: Config, env: NodeJS.ProcessEnv = proces
     vaultDurations,
     antRequiresApproval: (env.ANT_REQUIRES_APPROVAL ?? "true") !== "false",
     pollIntervalMs: parseInt(env.DISPATCH_POLL_INTERVAL_MS ?? "5000", 10),
+    confirmRpcUrl,
   };
 }
 
@@ -86,6 +110,36 @@ export async function loadSigner(role: SignerRole, env: NodeJS.ProcessEnv = proc
 export async function loadSignerRegistry(env: NodeJS.ProcessEnv = process.env): Promise<SignerRegistry> {
   const token = await loadSigner("token", env);
   if (!token) throw new Error("no treasury (token) signer configured — set TREASURY_KEY_SEALED_PATH + TREASURY_KEY_PASSPHRASE");
+  // ANT custody is OPERATOR-SUPPLIED per approval batch (loadColdAntSigner), NOT a
+  // persistent server key. A persistent `ant` signer is loaded ONLY if a
+  // deployment explicitly opts in via ANT_SIGNER_* (production does NOT).
   const ant = await loadSigner("ant", env);
   return { token, ant };
+}
+
+/**
+ * Load the OPERATOR-SUPPLIED cold ANT authority for a single approval batch
+ * (custody decision: cold authority signed per batch — NOT a persistent server
+ * key, NO bulk-move of the 2,269 ANTs). Precedence:
+ *   1. ANT_COLD_KEY_SEALED_PATH + ANT_COLD_KEY_PASSPHRASE -> EncryptedKeypairSigner
+ *   2. ANT_COLD_KEYPAIR_PATH -> a Solana CLI keypair JSON (64-byte array; the
+ *      cold authority's own key file), first 32 bytes = the seed.
+ * The caller runs `worker.runAntBatch(signer)` then discards the signer.
+ */
+export async function loadColdAntSigner(env: NodeJS.ProcessEnv = process.env): Promise<DispenserSigner> {
+  const sealedPath = env.ANT_COLD_KEY_SEALED_PATH;
+  const passphrase = env.ANT_COLD_KEY_PASSPHRASE;
+  if (sealedPath && passphrase) {
+    const sealed = JSON.parse(readFileSync(sealedPath, "utf8")) as SealedKey;
+    return EncryptedKeypairSigner.load("ant", sealed, passphrase);
+  }
+  const keypairPath = env.ANT_COLD_KEYPAIR_PATH;
+  if (keypairPath) {
+    const arr = JSON.parse(readFileSync(keypairPath, "utf8")) as number[];
+    if (!Array.isArray(arr) || arr.length < 32) throw new Error(`${keypairPath} is not a Solana keypair JSON (>=32 byte array)`);
+    return InMemoryKeypairSigner.fromSeed("ant", new Uint8Array(arr.slice(0, 32)));
+  }
+  throw new Error(
+    "no cold ANT signer: set ANT_COLD_KEY_SEALED_PATH + ANT_COLD_KEY_PASSPHRASE, or ANT_COLD_KEYPAIR_PATH",
+  );
 }

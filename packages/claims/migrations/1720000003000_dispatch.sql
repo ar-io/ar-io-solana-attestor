@@ -5,14 +5,19 @@
 -- operator-approval columns for the big-claim brake and the operator-gated ANT
 -- custody path (pivot plan §4.3, docs/CENTRALIZED_CLAIM_PIVOT_PLAN.md).
 --
--- Exactly-once mechanism (see src/dispatch/worker.ts):
+-- Exactly-once mechanism (see src/dispatch/worker.ts). NOTE: a retry re-signs
+-- against a FRESH blockhash, so it yields a DIFFERENT signature — the guarantee
+-- is persist-sig-before-broadcast + re-sign-ONLY-after-the-old-sig-is-PROVABLY-
+-- dead, not "recompute the same signature".
 --   * verified -> dispatching : the worker builds + SIGNS the dispensing tx,
 --     PERSISTS its signature (dispatch_signature) + the blockhash it was signed
---     against (dispatch_blockhash / dispatch_last_valid_bh) BEFORE broadcasting.
---     A crash between persist and land is recoverable: on restart the worker
---     checks the recorded signature via getSignatureStatuses. Found+confirmed ->
---     mark confirmed (no re-send). Not found + the blockhash's lastValidBlockHeight
---     has passed -> the exact tx can NEVER land, so it is safe to re-sign/resend.
+--     against (dispatch_blockhash / dispatch_last_valid_bh) and re-checks the
+--     ASSET is still claimable — all BEFORE broadcasting. A crash between persist
+--     and land is recoverable: on restart the worker checks the recorded
+--     signature via getSignatureStatuses (block height sampled BEFORE the status
+--     read, so a not-found past lastValidBlockHeight is provably dead).
+--     Found+confirmed -> mark confirmed (no re-send). Provably dead -> safe to
+--     re-sign a FRESH tx (new signature); the old one can never land.
 --   * dispatching -> confirmed : the tx confirmed on-chain; the asset flips to
 --     `claimed` (terminal). The one_live_claim_per_asset index + the asset state
 --     machine make a second dispense impossible even across a crash/retry.

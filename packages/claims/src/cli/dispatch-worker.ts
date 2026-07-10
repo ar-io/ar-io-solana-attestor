@@ -12,13 +12,15 @@ import { createRpc } from "../solana.js";
 import { SolanaChainGateway } from "../dispatch/chain.js";
 import { FloatManager } from "../dispatch/float.js";
 import { DispatchWorker } from "../dispatch/worker.js";
-import { loadDispatchConfig, loadSignerRegistry } from "../dispatch/dispatch-config.js";
+import { assertSingleConfirmRpc, loadDispatchConfig, loadSignerRegistry } from "../dispatch/dispatch-config.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
   const dispatch = loadDispatchConfig(config);
   const db = createDb(config.databaseUrl);
-  const gateway = new SolanaChainGateway(createRpc(config.solanaRpcUrl));
+  // Exactly-once confirmation reads MUST go through a single consistent endpoint.
+  assertSingleConfirmRpc(dispatch.confirmRpcUrl);
+  const gateway = new SolanaChainGateway(createRpc(dispatch.confirmRpcUrl));
   const signers = await loadSignerRegistry();
   const float = new FloatManager(dispatch.floatPolicy);
 
@@ -37,7 +39,13 @@ async function main(): Promise<void> {
 
   const hotAta = await worker.hotAta();
   // eslint-disable-next-line no-console
-  console.log(JSON.stringify({ msg: "dispatch worker start", tokenSigner: signers.token.address, antSigner: signers.ant?.address ?? null, hotAta }));
+  console.log(JSON.stringify({
+    msg: "dispatch worker start",
+    tokenSigner: signers.token.address,
+    antSigner: signers.ant?.address ?? "operator-supplied-per-batch (yarn dispatch:ants)",
+    confirmRpc: dispatch.confirmRpcUrl,
+    hotAta,
+  }));
 
   const once = process.argv.includes("--once");
   let running = true;

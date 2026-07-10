@@ -21,6 +21,7 @@
     "reconcile:ledger": "tsx src/cli/reconcile-ledger.ts",
     "encrypt:treasury-key": "tsx src/cli/encrypt-treasury-key.ts",
     "dispatch:worker": "tsx src/cli/dispatch-worker.ts",
+    "dispatch:ants": "tsx src/cli/dispatch-ants.ts",
     "dispatch:approve": "tsx src/cli/approve-claim.ts",
     "reconcile:dispatch": "tsx src/cli/reconcile-dispatch.ts"
   },

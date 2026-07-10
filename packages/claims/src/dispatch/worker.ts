@@ -4,26 +4,33 @@
 //! ---------------------------------------------------------------------------
 //! EXACTLY-ONCE — how a crash/retry can NEVER double-send
 //! ---------------------------------------------------------------------------
-//! A Solana tx signature is DETERMINISTIC from (message + signer), and a message
-//! is only landable while its blockhash is valid. The worker exploits both:
+//! The guarantee is NOT "recompute the same signature". A retry re-signs against
+//! a FRESH blockhash, so it produces a DIFFERENT signature. The guarantee is:
+//! PERSIST-the-signature-BEFORE-broadcast, and RE-SIGN ONLY AFTER the previous
+//! signature is PROVABLY dead (its blockhash can no longer land). A message is
+//! only landable while its blockhash is valid, so at most ONE of the signatures
+//! ever written for a claim can land.
 //!
 //!   1. FRESH dispatch (claim `verified` / approved `pending_review`):
 //!      - single-flight: `SELECT ... FOR UPDATE` on the claim row.
-//!      - build + SIGN the dispense tx -> get the deterministic signature.
-//!      - PERSIST the signature + its blockhash/lastValidBlockHeight and flip the
-//!        claim to `dispatching`, all in ONE committed txn — BEFORE broadcasting.
+//!      - build + SIGN the dispense tx -> get its signature.
+//!      - PERSIST the signature + its blockhash/lastValidBlockHeight, flip the
+//!        claim to `dispatching`, AND re-check the ASSET `FOR UPDATE` (must still
+//!        be `claiming`/`pending_review`, never `claimed`) — all in ONE committed
+//!        txn, BEFORE broadcasting. If the asset already moved to `claimed`, the
+//!        txn ABORTS: the signed tx is discarded and NEVER broadcast (the worker
+//!        is double-send-safe in isolation, not merely because M3 locked first).
 //!      - only AFTER that commit: broadcast the wire bytes, then confirm.
 //!      A crash anywhere here leaves a `dispatching` row with a recorded sig.
 //!
 //!   2. RECOVERY (claim `dispatching` with a recorded sig, seen on restart):
-//!      - getSignatureStatuses(sig):
+//!      - confirmSignature(sig) (height sampled BEFORE the status read; see chain.ts):
 //!          confirmed -> finalize (claim `confirmed`, asset `claimed`). No resend.
 //!          failed    -> claim `failed`; asset stays `claiming` for an operator
 //!                       (never auto-retried — the failure may be deterministic).
 //!          pending + blockhash still valid -> wait (a prior broadcast may land).
-//!          pending + lastValidBlockHeight passed -> the tx is PERMANENTLY dead
-//!                       (that exact signature can never land), so it is safe to
-//!                       re-sign a fresh tx and try again.
+//!          pending + lastValidBlockHeight passed -> the tx is PROVABLY dead, so
+//!                       it is safe to re-sign a fresh tx and try again.
 //!      At most ONE signature per claim can ever land, because a replacement is
 //!      only ever signed once the previous one is provably dead.
 //!
@@ -36,8 +43,10 @@
 //!   * token + vault settlements are signed by the HOT dispenser (float ≤ cap);
 //!     a claim over the float, or over the >100k brake without operator approval,
 //!     is NOT dispensed (queued for refill / routed to review).
-//!   * ANT dispatches use the SEPARATE `ant` signer and are operator-approval
-//!     gated by default — an NFT is NEVER auto-dispensed from a hot key.
+//!   * ANT dispatches use a SEPARATE cold `ant` signer, OPERATOR-SUPPLIED at
+//!     approval time for just that batch (NOT a persistent server key; NO bulk
+//!     move of the 2,269 ANTs). Operator-approval gated — an NFT is NEVER
+//!     auto-dispensed from a hot key. See `runAntBatch`.
 
 import { Buffer } from "node:buffer";
 import type { Pool, PoolClient } from "pg";
@@ -48,7 +57,7 @@ import { appendAudit } from "../api/audit.js";
 import { computeVaultSettlement } from "../verify/vault-settlement.js";
 import type { ChainGateway, SignedDispatch } from "./chain.js";
 import { FloatManager } from "./float.js";
-import { assertSeparableRoles, type SignerRegistry } from "./signer.js";
+import { assertSeparableRoles, type DispenserSigner, type SignerRegistry } from "./signer.js";
 import {
   claimMemoIx,
   createAtaIdempotentIx,
@@ -96,6 +105,7 @@ export type DispatchOutcome =
   | "deferred_refill"
   | "routed_to_review"
   | "awaiting_approval"
+  | "awaiting_ant_signer"
   | "skipped";
 
 export interface DispatchResult {
@@ -173,8 +183,15 @@ export class DispatchWorker {
     return r.rows.map((x) => x.claim_id);
   }
 
-  /** Process a single claim through the exactly-once state machine. */
-  async processClaim(claimId: string): Promise<DispatchResult> {
+  /**
+   * Process a single claim through the exactly-once state machine.
+   *
+   * `antSignerOverride` is the OPERATOR-SUPPLIED cold ANT signer loaded for the
+   * current approval batch (see `runAntBatch`). It is used ONLY for ANT assets;
+   * token/vault always use the hot dispenser. When absent, an ANT dispatch waits
+   * (there is intentionally no persistent server-side ANT key).
+   */
+  async processClaim(claimId: string, antSignerOverride?: DispenserSigner): Promise<DispatchResult> {
     // Snapshot (no lock) to decide the path; all mutations re-check under lock.
     const snap = await this.#loadClaim(this.#d.pool, claimId);
     if (!snap) return { claimId, assetKey: "", outcome: "skipped", detail: "no such claim" };
@@ -186,18 +203,47 @@ export class DispatchWorker {
     // before ever signing anything new. This is the "check for an existing
     // successful tx before sending" guard.
     if (snap.dispatch_signature && (snap.status === "dispatching" || snap.status === "verified")) {
-      return this.#recover(snap);
+      return this.#recover(snap, antSignerOverride);
     }
-    if (snap.status === "verified") return this.#dispatchFresh(claimId);
-    if (snap.status === "pending_review" && snap.approved_at) return this.#dispatchFresh(claimId);
+    if (snap.status === "verified") return this.#dispatchFresh(claimId, antSignerOverride);
+    if (snap.status === "pending_review" && snap.approved_at) return this.#dispatchFresh(claimId, antSignerOverride);
     if (snap.status === "pending_review") return { claimId, assetKey: snap.asset_key, outcome: "awaiting_approval" };
     return { claimId, assetKey: snap.asset_key, outcome: "skipped", detail: `status ${snap.status}` };
+  }
+
+  /**
+   * Operator ANT-dispatch batch (custody decision: cold authority, signed per
+   * approval batch). The operator loads the COLD ANT authority signer at
+   * approval time and passes it here; the worker dispatches every APPROVED ANT
+   * claim with it, then the caller discards the signer. No persistent
+   * server-side ANT key; no bulk-move of the 2,269 ANTs. `assertSeparableRoles`
+   * still guarantees this cold signer isn't the hot token dispenser.
+   */
+  async runAntBatch(coldAntSigner: DispenserSigner): Promise<DispatchResult[]> {
+    if (coldAntSigner.role !== "ant") {
+      throw new Error(`runAntBatch requires an 'ant'-role signer, got '${coldAntSigner.role}'`);
+    }
+    if (coldAntSigner.address === this.#d.signers.token.address) {
+      throw new Error("cold ANT signer must NOT be the hot token dispenser (separate blast radii)");
+    }
+    const r = await this.#d.pool.query<{ claim_id: string }>(
+      `SELECT c.claim_id FROM claims c JOIN assets a ON a.asset_key = c.asset_key
+        WHERE a.asset_type = 'ant'
+          AND (c.status = 'dispatching'
+               OR (c.status = 'pending_review' AND c.approved_at IS NOT NULL))
+        ORDER BY c.approved_at NULLS FIRST, c.created_at`,
+    );
+    const out: DispatchResult[] = [];
+    for (const { claim_id } of r.rows) {
+      out.push(await this.processClaim(claim_id, coldAntSigner));
+    }
+    return out;
   }
 
   // -------------------------------------------------------------------------
   // RECOVERY — a `dispatching` claim with a persisted signature.
   // -------------------------------------------------------------------------
-  async #recover(snap: ClaimRow): Promise<DispatchResult> {
+  async #recover(snap: ClaimRow, antSignerOverride?: DispenserSigner): Promise<DispatchResult> {
     const sig = snap.dispatch_signature as string;
     const lastValid = BigInt(snap.dispatch_last_valid_bh ?? "0");
     const state = await this.#d.gateway.confirmSignature(sig, lastValid);
@@ -215,7 +261,7 @@ export class DispatchWorker {
       // The persisted tx is permanently dead. Clear the dead sig and re-dispatch.
       await this.#clearDeadSignature(snap.claim_id);
       this.#log("recover: prior tx expired, re-dispatching", { claimId: snap.claim_id, deadSig: sig });
-      return this.#dispatchFresh(snap.claim_id);
+      return this.#dispatchFresh(snap.claim_id, antSignerOverride);
     }
     // pending + still valid: a prior broadcast may yet land; do not touch it.
     return { claimId: snap.claim_id, assetKey: snap.asset_key, outcome: "awaiting_confirmation", signature: sig };
@@ -224,31 +270,46 @@ export class DispatchWorker {
   // -------------------------------------------------------------------------
   // FRESH dispatch — verified / approved-pending_review.
   // -------------------------------------------------------------------------
-  async #dispatchFresh(claimId: string): Promise<DispatchResult> {
+  async #dispatchFresh(claimId: string, antSignerOverride?: DispenserSigner): Promise<DispatchResult> {
     const snap = await this.#loadClaim(this.#d.pool, claimId);
     if (!snap) return { claimId, assetKey: "", outcome: "skipped", detail: "vanished" };
     const asset = await this.#loadAsset(this.#d.pool, snap.asset_key);
     if (!asset) return { claimId, assetKey: snap.asset_key, outcome: "skipped", detail: "asset missing" };
 
+    // Cheap pre-sign guard (racy read; the authoritative one is the FOR UPDATE
+    // re-check in #persistDispatching): skip an already-terminal asset entirely.
+    if (asset.status === "claimed" || asset.status === "cancelled") {
+      return { claimId, assetKey: asset.asset_key, outcome: "skipped", detail: `asset ${asset.status}` };
+    }
+
     const approved = !!snap.approved_at;
     const claimant = address(snap.claimant);
 
-    // ---- ANT: separate signer, operator-approval gated (never auto-hot) ----
+    // ---- ANT: SEPARATE cold signer, OPERATOR-SUPPLIED per approval batch ----
     if (asset.asset_type === "ant") {
       const antRequiresApproval = this.#d.antRequiresApproval ?? true;
       if (antRequiresApproval && !approved) {
         await this.#routeToReview(claimId, asset.asset_key, "ant dispatch requires operator approval");
         return { claimId, assetKey: asset.asset_key, outcome: "awaiting_approval", detail: "ant needs approval" };
       }
-      if (!this.#d.signers.ant) {
-        await this.#routeToReview(claimId, asset.asset_key, "no ANT custody signer configured");
-        return { claimId, assetKey: asset.asset_key, outcome: "routed_to_review", detail: "no ant signer" };
+      // The cold ANT authority is loaded by the operator for this batch
+      // (runAntBatch) and passed in; `signers.ant` is a fallback only if a
+      // deployment explicitly configures one (production does NOT).
+      const antCustody = antSignerOverride ?? this.#d.signers.ant;
+      if (!antCustody) {
+        // Approved but no cold signer loaded in this invocation: it waits for the
+        // operator ANT batch. NOT routed to review (already approved) — just held.
+        return { claimId, assetKey: asset.asset_key, outcome: "awaiting_ant_signer", detail: "cold ant signer not loaded" };
+      }
+      if (antCustody.address === this.#d.signers.token.address) {
+        await this.#markFailed(claimId, "ANT signer must not be the hot dispenser");
+        return { claimId, assetKey: asset.asset_key, outcome: "failed", detail: "ant signer == hot key" };
       }
       if (!asset.ant_mint) {
         await this.#markFailed(claimId, "ant asset has no mint");
         return { claimId, assetKey: asset.asset_key, outcome: "failed", detail: "no ant mint" };
       }
-      const antSigner = await this.#d.signers.ant.getSigner();
+      const antSigner = await antCustody.getSigner();
       const ixs = this.#buildAntIxs(claimId, antSigner, address(asset.ant_mint), claimant);
       return this.#signPersistBroadcastConfirm(claimId, asset, antSigner, ixs, null);
     }
@@ -399,6 +460,20 @@ export class DispatchWorker {
       const canDispatch = c.status === "verified" || (c.status === "pending_review" && c.approved_at);
       if (!canDispatch) {
         await client.query("ROLLBACK");
+        return false;
+      }
+      // AUTHORITATIVE double-send guard (worker's own, not relying on M3's locks):
+      // re-load the ASSET `FOR UPDATE` in this same txn and ABORT unless it is
+      // still dispatch-eligible (`claiming` | `pending_review`). If it already
+      // moved to `claimed` (or was cancelled/frozen), the signed tx is DISCARDED
+      // and NEVER broadcast — no second on-chain transfer can occur. Lock order
+      // is claim-row-then-asset-row (== service.ts completeClaim), so no deadlock.
+      const a = await this.#loadAsset(client, assetKey, true);
+      if (!a || (a.status !== "claiming" && a.status !== "pending_review")) {
+        await client.query("ROLLBACK");
+        this.#log("persistDispatching: ABORT — asset not dispatch-eligible", {
+          claimId, assetKey, assetStatus: a?.status ?? "missing", deadSig: signed.signature,
+        });
         return false;
       }
       await client.query(
@@ -563,10 +638,10 @@ export class DispatchWorker {
     );
     return r.rows[0] ?? null;
   }
-  async #loadAsset(db: Pool | PoolClient, assetKey: string): Promise<AssetRow | null> {
+  async #loadAsset(db: Pool | PoolClient, assetKey: string, forUpdate = false): Promise<AssetRow | null> {
     const r = await db.query<AssetRow>(
       `SELECT asset_key, asset_type, ant_mint, amount::text AS amount, vault_end_ts::text AS vault_end_ts, status, recipient_id
-         FROM assets WHERE asset_key = $1`,
+         FROM assets WHERE asset_key = $1${forUpdate ? " FOR UPDATE" : ""}`,
       [assetKey],
     );
     return r.rows[0] ?? null;

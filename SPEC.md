@@ -786,9 +786,25 @@ Because the signer is pluggable, the `ant` role is the natural home for a
 **cold / KMS / Squads-multisig** backend brought online per-batch — so the 2,269
 ANTs stay off the hot path entirely (they can remain under the cold authority,
 approved in batches, or a JIT per-claim delegation). ANT claim frequency is low,
-so the operator-in-the-loop latency is acceptable. **Coordinator decision
-needed:** confirm operator-gated-cold-ANT (this default) vs. the bulk-hot-move,
-and pick the concrete `ant` backend (cold key file / KMS / Squads).
+so the operator-in-the-loop latency is acceptable.
+
+**DECISION (confirmed by the operator): cold authority, signed PER APPROVAL
+BATCH.** Implemented as the default: there is **no persistent server-side ANT
+key** and **no bulk-move of the 2,269 ANTs**. The dispatch worker's
+`SignerRegistry` is **token-only** in production (`loadSignerRegistry` loads
+`ant` only if a deployment explicitly opts in). A verified ANT claim routes to
+`pending_review`; the operator approves (`yarn dispatch:approve`), then runs
+`yarn dispatch:ants` with the **cold ANT authority loaded at runtime for that
+batch only** (`ANT_COLD_KEYPAIR_PATH` — a Solana keypair JSON — or a sealed
+blob + passphrase). That CLI calls `worker.runAntBatch(coldSigner)`, which
+dispenses every approved ANT with the cold key and then discards it. Between an
+approval and the batch run the claim sits in a new `awaiting_ant_signer`
+outcome (approved, but the cold key isn't loaded) — an NFT is provably never
+dispensed without the operator-supplied cold signer. `runAntBatch` also refuses
+a non-`ant`-role signer or one whose address equals the hot dispenser.
+**Proven live on surfpool** (token-only worker → gated → approved →
+`awaiting_ant_signer` → `runAntBatch(cold)` → `TransferV1`+`UpdateV1`, Owner+UA
+== claimant on-chain).
 
 ### Exactly-once dispatch (how a crash can't double-send)
 
@@ -852,33 +868,41 @@ orphan settle; an audit row per dispatch transition (`claim.dispatching` +
 
 ### Verification performed (M4)
 
-- **Unit (no DB, no chain): 34 tests.** crypto-box seal/open + fail-closed on
-  bad passphrase / GCM tamper; instruction byte-parity (SPL Transfer `[3,u64]`,
+- **Unit (no DB, no chain).** crypto-box seal/open + fail-closed on bad
+  passphrase / GCM tamper; instruction byte-parity (SPL Transfer `[3,u64]`,
   createIdempotent ATA `[1]`, MPL Core `TransferV1 [14,0]` / `UpdateV1
   [15,0,0,1,1,pubkey]`, `vaulted_transfer` disc = `sha256("global:vaulted_transfer")[..8]`
-  + args, memo); encrypted-signer load/unlock + separable-role guard; KMS/Squads
-  stubs; float brake/insufficient/cap/refill.
-- **DB-backed exactly-once (FakeChainGateway, 10 + 5 tests):** token happy path →
-  confirmed + asset claimed + ONE signature + idempotent re-run; **crash AFTER
-  land, before finalize → recovery confirms, NO re-send (signCount stays 1)**;
-  **crash BEFORE broadcast + blockhash expiry → re-sign, EXACTLY ONE tx lands**;
-  two concurrent workers on one claim → single dispatch; >100k brake → not
-  dispensed until approved; insufficient float → queued (deferred_refill);
-  ANT operator-gated → not dispensed until approved (via the ant signer);
-  vault-liquid vs vault-relock routing. Plus reconcile CATCHES tampers
+  + args, memo); **golden PDA test** — `deriveArioConfig` == mainnet
+  `EdtCcYk9…` + vault/vault_counter anchors; encrypted-signer load/unlock +
+  separable-role guard; KMS/Squads stubs; float brake/insufficient/cap/refill;
+  **TOCTOU expiry** (`chain.test.ts` — height-before-status, last-slot→pending,
+  provably-dead→expired).
+- **DB-backed exactly-once (FakeChainGateway):** token happy path → confirmed +
+  asset claimed + ONE signature + idempotent re-run; **crash AFTER land, before
+  finalize → recovery confirms, NO re-send (signCount stays 1)**; **crash BEFORE
+  broadcast + blockhash expiry → re-sign, EXACTLY ONE tx lands**; two concurrent
+  workers on one claim → single dispatch; >100k brake → not dispensed until
+  approved; insufficient float → queued (deferred_refill); vault-liquid vs
+  vault-relock routing; **already-claimed asset → ABORT, 0 transfers** +
+  **asset-flips-to-claimed-mid-sign → persist FOR UPDATE guard aborts, 0
+  transfers** (`worker.fixes.db.test.ts`); **ANT cold-authority-per-batch** —
+  token-only worker holds an approved ANT (`awaiting_ant_signer`) until
+  `runAntBatch(coldSigner)` dispenses it. Plus reconcile CATCHES tampers
   (dispatched≠claimed, missing sig, double-dispense, missing audit).
 - **LIVE on surfpool (mainnet-forked SVM) through the REAL `DispatchWorker` +
   the real DB** (`scripts/m4-localnet-proof.ts`): created an ARIO SPL mint,
   funded a 300k float, then **all six phases PASS** —
   (1) float funded; (2) **TOKEN** dispensed to a claimant ATA (on-chain balance
   == 1234 ARIO); (3) **idempotency** — re-run → `already_confirmed`, balance
-  unchanged; (4) **VAULT-liquid** dispensed (5000 ARIO); (5) **ANT** — minted an
-  MPL Core asset, operator-gated (`awaiting_approval`), approved, then
-  `TransferV1`+`UpdateV1` → **Owner AND UpdateAuthority both == claimant, read
-  back from the on-chain asset**; (6) **>100k brake** → `routed_to_review`,
-  balance 0. This is a full 3-asset-type on-chain dispense, not a simulation.
+  unchanged; (4) **VAULT-liquid** dispensed (5000 ARIO); (5) **ANT** (production
+  flow) — minted an MPL Core asset, token-only worker gated
+  (`awaiting_approval`), approved, held (`awaiting_ant_signer`), then
+  **`runAntBatch(cold authority)`** → `TransferV1`+`UpdateV1` → **Owner AND
+  UpdateAuthority both == claimant, read back from the on-chain asset**;
+  (6) **>100k brake** → `routed_to_review`, balance 0. A full 3-asset-type
+  on-chain dispense, not a simulation.
 - Full suite green: **attestor 11 + canonical 49 unchanged** (behavior
-  untouched), **claims 216 (no DB) / 268 (with DB)**. `build` + `typecheck` +
+  untouched), **claims 223 (no DB) / 286 (with DB)**. `build` + `typecheck` +
   `typecheck:tests` clean. Migration `1720000003000_dispatch` up + down verified.
 
 ### What I could NOT fully verify / caveats (M4)
@@ -908,3 +932,61 @@ orphan settle; an audit row per dispatch transition (`claim.dispatching` +
   lock makes concurrent workers safe (proven), but horizontal scaling of the
   float check across processes would want a distributed advisory lock — noted,
   not needed for the cutover's claim rate.
+
+### M4 — operational requirements
+
+- **Confirmation reads MUST use a single consistent RPC** (or a read quorum),
+  NOT a round-robin / load-balanced pool. Exactly-once rests on
+  `confirmSignature`'s "provably dead" classification, which reads
+  `getBlockHeight` + `getSignatureStatuses`; a lagging replica can report a
+  landed tx as not-found → misclassify `expired` → re-sign → **double-send**.
+  Configure via `CONFIRM_RPC_URL` (defaults to `SOLANA_RPC_URL`); the worker CLIs
+  build the gateway from it and `assertSingleConfirmRpc` warns on a pool-shaped
+  URL. This is an operational invariant, not something code can fully enforce.
+
+### M4 — tester round-1 fixes (post-gate)
+
+The tester passed the gate but flagged five defects; all fixed on this branch,
+each with a regression test:
+
+1. **Worker double-send-safe in isolation (MEDIUM/LOW #1).** The worker never
+   re-checked the asset before signing — a lone `verified` claim on an
+   already-`claimed` asset dispensed a SECOND transfer (not reachable via M3's
+   normal flow, but the worker must not rely solely on M3). Fix: a cheap pre-sign
+   asset-state skip **plus** the authoritative re-load of the asset
+   `FOR UPDATE` inside `#persistDispatching` (same txn as the claim lock, order
+   claim→asset == `service.ts`), aborting unless the asset is still
+   `claiming`/`pending_review`. On abort the signed tx is **discarded, never
+   broadcast**. Proven (`worker.fixes.db.test.ts`): already-claimed asset →
+   0 signs, 0 transfers; asset flipped to `claimed` mid-sign (via the fake's
+   `onSign` hook) → persist guard aborts, **0 transfers**, no `dispatch_signature`
+   persisted.
+2. **TOCTOU in expiry classification (MEDIUM/LOW #2).** `#statusOnce` read
+   statuses then height non-atomically — a tx landing in its final valid slot
+   between the reads could be misclassified `expired` → re-sign → double-send.
+   Fix: sample `getBlockHeight` **FIRST**, then statuses; only classify
+   `expired` when a not-found is observed at a height that was **already strictly
+   greater** than `lastValidBlockHeight` at sample time (`searchTransactionHistory`
+   kept). Proven (`chain.test.ts`): call order asserted height-before-status;
+   not-found at height==lastValid → `pending` (never expired); height>lastValid →
+   `expired`; landed-at-last-slot → `confirmed`.
+3. **`CONFIG_SEED` was wrong (MEDIUM #3).** It was `"config"`; ario-core uses
+   `b"ario_config"` (`state/mod.rs`), so `deriveArioConfig` derived the WRONG
+   PDA (latent — the worker routes relock to the operator, and on-chain it would
+   fail-safe as a `ConstraintSeeds` revert — but it broke the operator relock
+   tooling). Fixed + **golden PDA test** (`instructions.test.ts`):
+   `deriveArioConfig("73YoECm6…")` == the mainnet ArioConfig PDA
+   `EdtCcYk9RAHyakTSBwtJit6SJcrrk9hj82sASekszLf5`. Added regression anchors for
+   the vault + vault_counter derivations (seeds `b"vault"` / `b"vault_counter"`,
+   which were already correct). The SPEC's "PDA-derivations unit-tested" claim is
+   now true.
+4. **Single-RPC operational requirement (LOW/INFO #4).** See "operational
+   requirements" above — `CONFIRM_RPC_URL` + `assertSingleConfirmRpc` + docs.
+5. **Misleading determinism comment (INFO #5).** Reworded the worker / chain /
+   migration headers: a retry re-signs against a FRESH blockhash → a DIFFERENT
+   signature; the guarantee is persist-sig-before-broadcast +
+   re-sign-only-after-the-old-sig-is-PROVABLY-dead, not "recompute the same sig".
+
+Full suite after the fixes: **attestor 11 + canonical 49 unchanged**, **claims
+223 (no DB) / 286 (with DB)**; the live surfpool proof re-run green (now
+exercising the operator ANT-batch flow end-to-end on-chain).

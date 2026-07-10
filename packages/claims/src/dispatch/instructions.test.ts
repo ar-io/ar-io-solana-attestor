@@ -10,6 +10,9 @@ import {
   anchorDiscriminator,
   claimMemoIx,
   createAtaIdempotentIx,
+  deriveArioConfig,
+  deriveVault,
+  deriveVaultCounter,
   encodeVaultedTransferData,
   getAssociatedTokenAddress,
   MPL_CORE_PROGRAM,
@@ -102,6 +105,32 @@ describe("ario-core vaulted_transfer (vault re-lock)", () => {
 
   it("rejects a zero / out-of-range amount", () => {
     assert.throws(() => encodeVaultedTransferData(0n, 100n, false), /out of range/);
+  });
+});
+
+describe("ario-core PDA derivations (golden)", () => {
+  // Mainnet ario-core program + the ArioConfig PDA it produces (mainnet-config.json).
+  // This pins CONFIG_SEED = b"ario_config" (a wrong seed derives a different PDA).
+  const CORE = A("73YoECm6NKXpVRoe5f1Q9BcP5DJGPFUjnFy6AxBE5Nvh");
+  const MAINNET_ARIO_CONFIG = "EdtCcYk9RAHyakTSBwtJit6SJcrrk9hj82sASekszLf5";
+
+  it("deriveArioConfig reproduces the mainnet ArioConfig PDA", async () => {
+    const cfg = await deriveArioConfig(CORE);
+    assert.equal(cfg, MAINNET_ARIO_CONFIG);
+  });
+
+  it("vault + vault_counter derivations are deterministic + valid (regression anchors)", async () => {
+    const cfg = await deriveArioConfig(CORE);
+    // Derived once with the corrected seeds (b"vault_counter" / b"vault") and
+    // pinned so a future seed regression is caught. Recipient == the config PDA
+    // here purely as a stable, well-known input.
+    const counter = await deriveVaultCounter(CORE, cfg);
+    const vault0 = await deriveVault(CORE, cfg, 0n);
+    assert.equal(counter, "6PyVUm3wsTEzTvKgym9euyZUVYs4ZEcyF4BshuAFGSCs");
+    assert.equal(vault0, "BWc3asf2GCiymhG9F99N3u3p4szMUqbh4pbFWxGy2M1s");
+    // vault id is part of the seed -> a different id is a different PDA.
+    const vault1 = await deriveVault(CORE, cfg, 1n);
+    assert.notEqual(vault0, vault1);
   });
 });
 

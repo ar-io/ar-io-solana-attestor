@@ -260,7 +260,9 @@ async function main(): Promise<void> {
   const antSignerObj = await InMemoryKeypairSigner.fromSeed("ant", antSeed);
   const hotKp = await (await import("@solana/kit")).createKeyPairSignerFromPrivateKeyBytes(hotSeed);
   const antKp = await (await import("@solana/kit")).createKeyPairSignerFromPrivateKeyBytes(antSeed);
-  const signers: SignerRegistry = { token: hotSigner, ant: antSignerObj };
+  // Production posture: token-only registry (NO persistent ant key). The cold ANT
+  // authority (antSignerObj) is "operator-supplied" per batch via runAntBatch.
+  const signers: SignerRegistry = { token: hotSigner };
 
   log("funding SOL to payer + signers via airdrop…");
   for (const a of [payer.address, hotKp.address, antKp.address]) {
@@ -317,15 +319,19 @@ async function main(): Promise<void> {
     log("minted core asset", { antMint, owner: beforeOwn.owner });
     const claimant3 = await generateKeyPairSigner();
     const a = await seedVerifiedClaim({ assetType: "ant", antMint, claimant: claimant3.address });
-    const rGate = await worker.processClaim(a.claimId); // operator-gated -> awaiting_approval
+    const rGate = await worker.processClaim(a.claimId); // token-only worker -> awaiting_approval
     await DispatchWorker.approveClaim(db.pool, a.claimId, "proof-operator");
-    const rAnt = await worker.processClaim(a.claimId);
+    const rHeld = await worker.processClaim(a.claimId); // approved but no cold key loaded -> held
+    // Operator loads the COLD ANT authority for THIS batch and dispenses it.
+    const batch = await worker.runAntBatch(antSignerObj);
+    const rAnt = batch.find((x) => x.claimId === a.claimId);
     const afterOwn = await readCoreOwnerAndUA(antMint);
-    const ok = rGate.outcome === "awaiting_approval" && rAnt.outcome === "confirmed" &&
+    const ok = rGate.outcome === "awaiting_approval" && rHeld.outcome === "awaiting_ant_signer" &&
+      rAnt?.outcome === "confirmed" &&
       afterOwn.owner === claimant3.address && afterOwn.updateAuthority === claimant3.address;
-    expect("phase5_ant_owner_ua", ok, `gate=${rGate.outcome} dispatch=${rAnt.outcome} owner=${afterOwn.owner} ua=${afterOwn.updateAuthority} claimant=${claimant3.address}`);
+    expect("phase5_ant_cold_batch_owner_ua", ok, `gate=${rGate.outcome} held=${rHeld.outcome} batch=${rAnt?.outcome} owner=${afterOwn.owner} ua=${afterOwn.updateAuthority} claimant=${claimant3.address}`);
   } catch (e) {
-    expect("phase5_ant_owner_ua", false, `ANT live path error: ${(e as Error).message}`);
+    expect("phase5_ant_cold_batch_owner_ua", false, `ANT live path error: ${(e as Error).message}`);
   }
 
   // ---- Phase 6: >100k brake ----

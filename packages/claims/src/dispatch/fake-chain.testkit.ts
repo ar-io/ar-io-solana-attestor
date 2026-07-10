@@ -32,6 +32,9 @@ export class FakeChainGateway implements ChainGateway {
   dropBroadcast = false;
   failOnLand = false;
   forcePendingCount = 0;
+  /** Hook fired at the START of signTransaction (before the worker persists) —
+   *  lets a test flip DB state to exercise the persist-time FOR UPDATE guard. */
+  onSign?: () => Promise<void>;
 
   #wireToSig = new Map<string, string>();
   #txs = new Map<string, TxState>();
@@ -56,6 +59,7 @@ export class FakeChainGateway implements ChainGateway {
     void ixs;
     void _feePayer;
     void _extra;
+    if (this.onSign) await this.onSign();
     this.signCount += 1;
     const signature = `SIG${this.signCount}_${Math.random().toString(36).slice(2, 10)}`;
     const lastValidBlockHeight = this.blockHeight + 150n;

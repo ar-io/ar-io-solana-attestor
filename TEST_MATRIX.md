@@ -132,10 +132,13 @@ LIVE surfpool proof `scripts/m4-localnet-proof.ts`. See `SPEC.md` → "M4".
 | D8 | Two concurrent workers, one claim | fake DB | single dispatch (row-lock serialized) |
 | D9 | >100k big-claim brake | live surfpool + fake DB | `routed_to_review`, NOT dispensed until approved |
 | D10 | Insufficient float | fake DB | `deferred_refill`, claim stays queued, nothing signed |
-| D11 | ANT operator-gated (never auto-hot) | live surfpool + fake DB | `awaiting_approval`; dispensed only after approve, via `ant` signer |
+| D11 | ANT operator-gated, **cold authority per batch** | live surfpool + fake DB | token-only worker → `awaiting_approval` → approve → `awaiting_ant_signer` → `runAntBatch(cold)` dispenses; never a persistent server ANT key |
 | D12 | Encrypted-at-rest hot key | unit | seal/open round-trips; wrong passphrase / tamper fail closed; seed never on disk |
 | D13 | Pluggable signer | unit | EncryptedKeypairSigner default; KMS/Squads stubs conform; separable-role guard |
 | D14 | Reconcile-after-dispatch | fake DB | dispatched==claimed; catches tamper / double-dispense / missing sig+audit |
+| D15 | **Worker double-send-safe in isolation** (fix #1) | fake DB | lone `verified` claim on an already-`claimed` asset → ABORT, 0 transfers; asset flips to claimed mid-sign → persist `FOR UPDATE` guard aborts, 0 transfers |
+| D16 | **TOCTOU-safe expiry** (fix #2) | unit | height sampled before status; last-slot-land → pending (not expired); provably-dead → expired |
+| D17 | **`deriveArioConfig` golden** (fix #3) | unit | == mainnet `EdtCcYk9…`; vault/vault_counter regression anchors |
 
 Residuals: vault RE-LOCK not exercised live (needs deployed ario-core +
 ArioConfig + vault ATA); SPL Memo disabled in the surfnet proof (datasource

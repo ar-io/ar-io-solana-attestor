@@ -174,7 +174,10 @@ export function mplCoreUpdateAuthorityIx(args: {
 // ---------------------------------------------------------------------------
 // ario-core vaulted_transfer — treasury-signed vault RE-LOCK (ADR-027).
 // ---------------------------------------------------------------------------
-export const CONFIG_SEED = new TextEncoder().encode("config");
+// Must match ario-core `state/mod.rs`: CONFIG_SEED = b"ario_config",
+// VAULT_SEED = b"vault", VAULT_COUNTER_SEED = b"vault_counter". (Golden PDA
+// tests in instructions.test.ts pin these against the mainnet ArioConfig PDA.)
+export const CONFIG_SEED = new TextEncoder().encode("ario_config");
 export const VAULT_COUNTER_SEED = new TextEncoder().encode("vault_counter");
 export const VAULT_SEED = new TextEncoder().encode("vault");
 

@@ -6,16 +6,27 @@
 //! split into SIGN -> persist -> BROADCAST -> CONFIRM, which is what makes
 //! dispensing exactly-once WITHOUT durable nonces (pivot plan §4.3):
 //!
-//!   signTransaction()  builds + signs, returns the deterministic signature +
-//!                      the blockhash/lastValidBlockHeight it was signed against.
-//!                      The worker PERSISTS this BEFORE broadcasting.
+//!   signTransaction()  builds + signs against a FRESH blockhash and returns the
+//!                      resulting signature (+ that blockhash/lastValidBlockHeight).
+//!                      The worker PERSISTS the signature BEFORE broadcasting. NOTE:
+//!                      a RETRY re-signs with a *new* blockhash, so it yields a
+//!                      DIFFERENT signature — the guarantee is NOT "recompute the
+//!                      same sig", it is persist-sig-before-broadcast +
+//!                      re-sign-only-after-the-old-sig-is-PROVABLY-dead.
 //!   broadcast()        sends the already-signed wire bytes. Safe to call twice
-//!                      (same signature => the network dedups).
+//!                      with the same bytes (identical signature => network dedups).
 //!   confirmSignature() polls getSignatureStatuses; on recovery this tells the
-//!                      worker whether the persisted tx landed.
+//!                      worker whether the persisted signature landed.
 //!   getBlockHeight()   + the persisted lastValidBlockHeight answers "can the
-//!                      persisted tx still land?" — if height passed and the sig
-//!                      is not found, the tx is permanently dead => safe to re-sign.
+//!                      persisted tx still land?" — height sampled BEFORE the
+//!                      status read (see #statusOnce) makes a not-found past
+//!                      lastValidBlockHeight PROVABLY dead => safe to re-sign.
+//!
+//! OPERATIONAL REQUIREMENT (exactly-once depends on it): the RPC passed here for
+//! the confirmation reads (getSignatureStatuses + getBlockHeight) MUST be a
+//! SINGLE consistent endpoint (or a read quorum), NOT a round-robin/load-balanced
+//! pool. A lagging replica can report a landed tx as not-found and break the
+//! "provably dead" premise. See SPEC.md "M4 — operational requirements".
 //!
 //! No `@solana/web3.js`.
 
@@ -157,8 +168,18 @@ export class SolanaChainGateway implements ChainGateway {
       .send();
   }
 
-  /** One raw status lookup (no polling) — used to classify a signature's fate. */
+  /** One raw status lookup (no polling) — used to classify a signature's fate.
+   *
+   * TOCTOU-safe expiry (order matters): sample block HEIGHT *before* the status
+   * read. If we read statuses first and height second, a tx landing in its final
+   * valid slot BETWEEN the two reads would be seen not-found (early) then
+   * height>lastValid (late) -> misclassified `expired` -> re-sign -> DOUBLE SEND.
+   * Reading height first makes not-found definitive: if height was already
+   * strictly past `lastValidBlockHeight` at sample time, then by the time we do
+   * the LATER status read every slot the tx could have landed in has been
+   * produced — a still-not-found is provably dead. */
   async #statusOnce(signature: string, lastValidBlockHeight: bigint): Promise<ConfirmState> {
+    const heightAtSample = await this.getBlockHeight(); // FIRST — see doc above
     const statuses = await this.#rpc
       .getSignatureStatuses([signature as Parameters<KitRpc["getSignatureStatuses"]>[0][number]], {
         searchTransactionHistory: true,
@@ -171,9 +192,9 @@ export class SolanaChainGateway implements ChainGateway {
       if (c === "confirmed" || c === "finalized") return "confirmed";
       return "pending"; // processed but not yet confirmed
     }
-    // Not found. If the blockhash can no longer be used, the tx is dead.
-    const height = await this.getBlockHeight();
-    if (height > lastValidBlockHeight) return "expired";
+    // Not found AND, at the moment sampled BEFORE this read, height was already
+    // strictly past the last valid slot -> the exact tx can never land. Dead.
+    if (heightAtSample > lastValidBlockHeight) return "expired";
     return "pending";
   }
 
