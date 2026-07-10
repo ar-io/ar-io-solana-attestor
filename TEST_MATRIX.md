@@ -82,6 +82,39 @@ formats incl. the ETH case-stability lesson). The schema migrates up/down;
 custody/admin-plane behaviors that land with the admin endpoints in M3+; M1
 only builds the ledger they operate on.
 
+## M3 status — claims API + replay/double-claim defense (this milestone)
+
+The M3 cross-cutting rows above are now **implemented and green** against real
+Postgres with the real mainnet ledger (built by `build:ledger`). Rows 1–4 have
+their **API path** (initiate/complete/lookup) landed; the on-chain dispense
+(Owner+UA transfer, SPL transfer, `vaulted_transfer`) is still M4.
+
+- **Double-claim impossible under concurrency** — `service.db.test.ts` fires 8
+  parallel completes: (a) 8 DIFFERENT valid claims for one asset → **exactly 1
+  verified, 7 clean ALREADY_CLAIMED**; (b) 8 completes of the SAME claim → 8
+  successes but **one dispatch intent / one `claim.verified` audit row**
+  (idempotent). Enforced by `SELECT … FOR UPDATE` on the claim then the asset row
+  + the `available→claiming→claimed` state machine, backstopped by
+  `one_live_claim_per_asset`.
+- **Replay / stale-nonce** — single-use challenge nonce bound into the canonical:
+  replay after success → ALREADY_CLAIMED / idempotent; expired challenge → 409
+  CHALLENGE_EXPIRED (asset not consumed); wrong echoed `nonceHex` → NONCE_MISMATCH;
+  a proof for asset A rejected against asset B (canonical binding), B untouched.
+- **Idempotency** — `idempotencyKey` (UNIQUE) + the claimId make retried
+  initiate/complete return the same result with no second dispatch intent.
+- **Rate limiting** — per-IP over all `/v1` + per-identity, fixed-window
+  (`rate-limit.test.ts`; HTTP 429 proven via `app.inject`).
+- **audit_log** — one row per transition with a real sha256 hash chain (M6 signs).
+- **manual_review exclusion** (M1 row) re-proven at the API: `GET /v1/claimable`
+  returns `available` only; a manual_review recipient → `assets:[]`; a
+  manual_review asset → 404.
+- Rows 7/8 (cancel-*) + AT-RISK attach-pubkey remain the **admin plane** (a later
+  slice); M3 shipped the public claim plane.
+
+Endpoint shapes, the locking strategy, and the replay/idempotency model are in
+`SPEC.md` → "M3". Full suite: **claims 199** (28 new) + attestor 11 + canonical 49
+unchanged.
+
 ## Note on ADR-022 vs ADR-027 (vault settlement)
 
 `escrow-claim-runner.ts` currently reflects the **ADR-022** on-chain

@@ -9,11 +9,16 @@ import Fastify, { type FastifyInstance } from "fastify";
 
 import type { Config } from "./config.js";
 import type { Db } from "./db.js";
+import { registerClaimsRoutes } from "./api/routes.js";
+import { createRateLimiters, type RateLimiters } from "./api/rate-limit.js";
 
 export interface BuildAppOptions {
   config: Config;
-  /** Optional DB handle; when present, /health/ready round-trips it. */
+  /** Optional DB handle; when present, /health/ready round-trips it AND the
+   *  /v1 claim surface (initiate/complete/lookup) is mounted. */
   db?: Db;
+  /** Optional pre-built limiters (tests inject a fixed clock / tiny limits). */
+  limiters?: RateLimiters;
 }
 
 export function buildApp(opts: BuildAppOptions): FastifyInstance {
@@ -56,6 +61,19 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
       return { ready: false, db: "down", detail: (err as Error).message };
     }
   });
+
+  // Mount the /v1 claim surface only when a DB is wired (it is persistence-
+  // backed). Bare unit tests that pass no `db` still get /health.
+  if (db) {
+    const limiters =
+      opts.limiters ??
+      createRateLimiters({
+        windowMs: 60_000,
+        ipLimit: config.rateLimitPerMin,
+        identityLimit: config.rateLimitIdentityPerMin,
+      });
+    registerClaimsRoutes(app, { config, db, limiters });
+  }
 
   return app;
 }

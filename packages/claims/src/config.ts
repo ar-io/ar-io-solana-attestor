@@ -24,6 +24,17 @@ export interface Config {
   network: Network;
   databaseUrl: string;
   solanaRpcUrl: string;
+  /** M3: TTL of the single-use claim challenge (ms). Default 15 min. */
+  challengeTtlMs: number;
+  /** M3: claims with amount (or recipient total) above this route to
+   *  pending_review (the §4.3 big-claim brake). mARIO bigint. Default 100k ARIO. */
+  bigClaimThresholdMario: bigint;
+  /** M3: per-IP requests/min (mirrors the attestor's RATE_LIMIT_PER_MIN). */
+  rateLimitPerMin: number;
+  /** M3: per-identity requests/min (recipient/source address dimension). */
+  rateLimitIdentityPerMin: number;
+  /** M3: value for the Access-Control-Allow-Origin header ("*" or an origin). */
+  corsOrigin: string;
 }
 
 export type Network = "solana-mainnet" | "solana-devnet" | "localnet";
@@ -62,6 +73,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`PORT must be a valid port number, got "${env.PORT}"`);
   }
 
+  const challengeTtlMs = parseInt(env.CLAIM_CHALLENGE_TTL_MS ?? "900000", 10); // 15 min
+  if (!Number.isInteger(challengeTtlMs) || challengeTtlMs <= 0) {
+    throw new Error(`CLAIM_CHALLENGE_TTL_MS must be a positive integer, got "${env.CLAIM_CHALLENGE_TTL_MS}"`);
+  }
+
+  // 100,000 ARIO = 100_000 * ONE_TOKEN(1e6) mARIO.
+  const bigClaimThresholdMario = BigInt(env.BIG_CLAIM_THRESHOLD_MARIO ?? "100000000000");
+  if (bigClaimThresholdMario < 0n) {
+    throw new Error(`BIG_CLAIM_THRESHOLD_MARIO must be >= 0, got "${env.BIG_CLAIM_THRESHOLD_MARIO}"`);
+  }
+
   return {
     port,
     host: env.HOST ?? "0.0.0.0",
@@ -69,5 +91,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     network,
     databaseUrl: env.DATABASE_URL ?? DEFAULT_DATABASE_URL,
     solanaRpcUrl: env.SOLANA_RPC_URL ?? DEFAULT_RPC_BY_NETWORK[network],
+    challengeTtlMs,
+    bigClaimThresholdMario,
+    rateLimitPerMin: parseInt(env.RATE_LIMIT_PER_MIN ?? "60", 10),
+    rateLimitIdentityPerMin: parseInt(env.RATE_LIMIT_IDENTITY_PER_MIN ?? "20", 10),
+    corsOrigin: env.CORS_ORIGIN ?? "*",
   };
 }

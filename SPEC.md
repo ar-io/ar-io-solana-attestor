@@ -554,3 +554,160 @@ no signing in the runtime. keccak256 comes from the already-present
   on-chain the deposit's `recipient_protocol` fixes the valid claim path). The
   "proof.protocol == recipient.protocol" rule is enforced by each verifier's
   internal guard + the length gate, not by a separate top-level field.
+
+## M3 — Claims API + replay / double-claim defense
+
+The HTTP + persistence layer over M1's ledger + M2's verifier (pivot plan §4.1).
+On-chain dispatch/custody is NOT here — that's M4; a completed claim records a
+**dispatch intent** M4 consumes. All code is in `packages/claims/src/api/` plus
+migration `1720000002000_claims_api.sql`.
+
+### Endpoints (real shapes)
+
+- `GET /v1/claimable?protocol=&address=` **or** `?recipientId=` — read-only
+  lookup by identity. ETH addresses normalize case-insensitively
+  (`normalizeSourceAddress`). Returns `{ recipientId, protocol, sourceAddress,
+  assets:[{ assetKey, assetType, antMint, amount(string mARIO), vaultEndTimestamp,
+  nonceHex, status }] }`. **`status='available'` only — `manual_review`/AT-RISK
+  assets are excluded entirely** (a manual_review recipient returns `assets:[]`).
+- `GET /v1/assets/{assetKey}` — single asset, same element shape; `manual_review`
+  hidden as 404.
+- `POST /v1/claims/initiate` `{ assetKey, claimant, idempotencyKey? }` → `201
+  { claimId, status:"claiming", protocol, recipientId, network, nonceHex,
+  canonicalMessageHex, canonicalMessageBase64, expiresAt }`. Mints a **fresh
+  single-use 32-byte challenge nonce** + expiry, persists a `claiming` claim
+  bound to (asset, claimant, nonce, expiry), and returns the **exact canonical
+  bytes to sign** — server-built from ledger state via M2's
+  `buildCanonicalFromLedger` (never client bytes).
+- `POST /v1/claims/complete` `{ claimId | idempotencyKey, nonceHex?, proof }` →
+  `202 { claimId, status:"verified"|"pending_review", settlement, idempotentReplay }`.
+  Rebuilds the canonical from the STORED challenge nonce + recipient + asset,
+  verifies via M2 `verifyClaim`, and atomically consumes the asset. Proof shape
+  is §4.1's: `{protocol:"arweave", rsaSignatureBase64Url, rsaModulusBase64Url?,
+  saltLength?}` or `{protocol:"ethereum", signatureHex}`.
+- `GET /v1/claims/{claimId}` — claim status.
+
+### Claim state machine + how double-claim is prevented
+
+Asset: `available → claiming → claimed`. `claiming` = a verified claim has WON it
+(dispatch intent recorded; M4 dispenses); `claimed` = M4 confirmed on-chain
+(terminal). Any state ≠ `available` reads as "already claimed" to a competing
+claim. Claim: `claiming → verified` (dispatch intent) `| pending_review | rejected
+| expired`.
+
+`completeClaim` is ONE transaction with **two row locks, always in the same order
+(no deadlock cycle)**:
+1. `SELECT … FROM claims WHERE claim_id = $1 FOR UPDATE` — the claim row.
+2. `SELECT … FROM assets WHERE asset_key = $1 FOR UPDATE` — the asset row.
+
+- **Two parallel completes of DIFFERENT claims for the SAME asset** lock
+  different claim rows, then serialize on the asset row. The first sees
+  `available`, verifies, flips it to `claiming`; the rest then see `claiming` and
+  return a clean **409 ALREADY_CLAIMED** (without even re-verifying). Exactly one
+  wins — enforced by the Postgres lock + the state machine, NOT an app-level
+  read-then-write.
+- **N parallel completes of the SAME claim** serialize on the claim row; the
+  first transitions it to `verified`, the rest observe the terminal state and
+  return the SAME result (`idempotentReplay:true`) with **no second dispatch
+  intent**.
+- Backstop: the partial-unique index `one_live_claim_per_asset` (over
+  `verified|pending_review|dispatching`) makes a second won-claim a 23505 →
+  mapped to ALREADY_CLAIMED, so even a logic bug can't double-dispense.
+
+### Replay / idempotency model
+
+- **Single-use challenge nonce**, minted at initiate, bound into the canonical the
+  client signs, consumed when the asset transitions out of `available`. A replayed
+  proof after success → the asset is `claiming`/`claimed` → ALREADY_CLAIMED (or,
+  for the same claim, an idempotent replay of the stored success). An **expired
+  challenge** → claim `expired`, **409 CHALLENGE_EXPIRED**, asset NOT consumed. A
+  wrong **echoed `nonceHex`** → M2 `NONCE_MISMATCH` (409).
+- **Proof for asset A cannot claim asset B**: the canonical binds the asset id +
+  challenge nonce; the server rebuilds it for B, so A's signature fails to verify
+  (401/422) and B stays `available`. (M2 binds this; M3 enforces it end-to-end.)
+- **Idempotency**: `idempotencyKey` (UNIQUE) makes a retried initiate return the
+  SAME claim and a retried complete return the SAME result without a second
+  dispatch intent. The claim's own identity (`claimId`) is the natural idempotency
+  unit even without a client key.
+- **Bad proof** → claim `rejected`, asset untouched (never consumed on a failed
+  verification); the user re-initiates a fresh challenge.
+
+### Schema changes (`1720000002000_claims_api.sql`)
+
+Assets gain the `claiming` status. Claims gain `challenge_nonce`,
+`challenge_expires_at`, `recipient_id`, `protocol`, `updated_at`;
+`user_signature` becomes nullable (a claim is created at initiate, before the
+signature exists); a `claims_status_ck` is added; `one_live_claim_per_asset` is
+recreated over the won states. Migrates up **and** down cleanly (verified against
+the same Postgres the ledger is built into).
+
+### Rate limiting + audit
+
+- `src/api/rate-limit.ts` — dependency-free fixed-window limiter, two dimensions
+  (per-IP over all `/v1`, per-identity on identity-bearing routes), mirroring the
+  attestor's `express-rate-limit` posture. Bounded memory (lazy GC + FIFO cap).
+- `src/api/audit.ts` — every transition (`claim.initiate|verified|rejected|
+  expired|pending_review`) appends one `audit_log` row with enough to reconstruct
+  the claim. M3 already writes a **real sha256 hash chain** (`entry_hash =
+  sha256(prev_hash || canonical_json(entry))`, serialized by a transaction-scoped
+  advisory lock); the `signature` column holds a 64-byte zero placeholder that
+  **M6** replaces with the Ed25519 audit-key signature.
+
+### Vault settlement (provisional)
+
+For vault assets, `completeClaim` records a coarse `settlement` (`liquid|relock`)
+via the deposit-time `vaultEscrowFallsBackToLiquid` + an expiry check. **M4
+recomputes it live** from `ArioConfig.min/max_vault_duration` at dispatch (the
+authoritative decision); M3's value is advisory for the audit trail.
+
+### Money & reuse
+
+Money is `bigint` mARIO throughout (`NUMERIC(20,0)` ↔ `BigInt`); the API amount
+field is a decimal string, never a JS number. Verification is **100% M2
+`verifyClaim`** — no crypto re-implemented. No `@solana/web3.js` in the runtime.
+
+### Verification performed (M3)
+
+Real Postgres (dedicated container) with the **real mainnet ledger** built from
+the frozen inputs (`build:ledger` → recipients=8347, assets=10893, available=10711,
+manual_review=182). Then:
+
+- `GET /v1/claimable` against real recipients (AR 157-asset, ETH 22-asset);
+  ETH mixed-case body normalized; unknown identity 404; manual_review asset 404;
+  manual_review recipient → `assets:[]`.
+- `POST /v1/claims/initiate` on a real asset → server-built canonical
+  (`ar.io escrow claim` header, F-1 recipient binding) + fresh challenge.
+- Full `initiate → sign → complete → status` over HTTP (curl/fetch) with a
+  **synthetic ETH identity we hold the key for** (real recipients' keys are
+  theirs): 202 verified, idempotent replay 202 (`idempotentReplay:true`), asset →
+  `claiming`, audit trail `claim.initiate, claim.verified`, bad proof → 401 with
+  the asset left `available`.
+- **Concurrency (the gate)**: `service.db.test.ts` fires **8 parallel completes**
+  against real Postgres — (a) 8 DIFFERENT valid claims for ONE asset →
+  **exactly 1 verified, 7 ALREADY_CLAIMED**, asset consumed once, one dispatch
+  intent; (b) 8 completes of the SAME claim → **8 successes, 7 idempotent replays,
+  one `claim.verified` audit row** (no double dispatch). Plus AR RSA-PSS (salt 0
+  and 32), replay-across-assets, expired challenge, re-initiate-after-claim, bad
+  signature, nonce echo mismatch, big-claim brake → `pending_review`, wrong
+  protocol → `PROTOCOL_MISMATCH`.
+- Full suite green: **claims 199** (28 new M3: service.db 12, http 3, rate-limit 6,
+  errors 4, audit 3) + **attestor 11 + canonical 49 unchanged**. Lint/typecheck
+  (incl. `typecheck:tests`) clean. Migration up/down round-trips.
+
+### What I could NOT fully verify / caveats (M3)
+
+- **`complete` is driven with synthetic recipient keypairs**, not captured
+  mainnet-wallet signatures (those keys are the real owners' alone). The canonical
+  bytes are server-built from the real ledger and the RSA-PSS/secp256k1 primitives
+  are M2's contract-pinned code, so a self-signed proof over the real canonical is
+  a faithful drive — the same technique the M2 golden vectors use.
+- The concurrency proof runs at **8-way** parallelism against a local Postgres 16.
+  The guarantee is structural (row-lock serialization), not load-dependent, but I
+  did not run a high-N soak.
+- The DB-backed API/concurrency tests are **not wired into CI** yet — they need a
+  Postgres service + the migrated M3 schema (the M0/M1 pattern). The fast unit
+  tests (rate-limit, errors, audit-json) run without a DB. The tester reproduces
+  the DB gate with `migrate:up` + `DATABASE_URL`.
+- `settlement` is **provisional** (see above); the big-claim brake checks the
+  per-asset amount and the recipient's available total, but the operator
+  approval/dispatch flow itself is **M4**.
