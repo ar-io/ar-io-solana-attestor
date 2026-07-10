@@ -60,7 +60,7 @@ Pick a cadence (daily is typical) and schedule it; keep the anchor key funded.
 Third-party verification (pins the ORIGINAL anchor tx + the signer — never the
 operator DB):
 ```bash
-yarn verify:transparency anchor --anchor-sig <txid> --anchor-address <LEDGER_PUBLISHER address> \
+yarn verify:transparency audit --anchor-sig <txid> --anchor-address <LEDGER_PUBLISHER address> \
   --rpc '<rpc>' --database '...'
 # reads the memo BACK FROM CHAIN, confirms the live log still reproduces the
 # anchored hash at the anchored seq (checkExtendsAnchor), and that the anchor tx
@@ -69,7 +69,7 @@ yarn verify:transparency anchor --anchor-sig <txid> --anchor-address <LEDGER_PUB
 
 ## 3. Reserves — proof of holdings
 
-`GET /v1/transparency/reserves` (and `yarn ops:metrics | jq '.snapshot.reserves'`)
+`GET /v1/transparency/reserves` (and `yarn --silent ops:metrics | jq '.snapshot.reserves'`)
 reports live on-chain holdings vs. the outstanding ledger liability so anyone can
 check **holdings ≥ liabilities**:
 

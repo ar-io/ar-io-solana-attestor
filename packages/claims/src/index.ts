@@ -29,6 +29,22 @@ async function main(): Promise<void> {
 
   const app = buildApp({ config, db });
 
+  // Log the effective safety knobs at boot (bigint -> string; pino can't serialize
+  // bigint). Makes the whale-brake threshold auditable and surfaces a misconfigured
+  // trust-proxy / metrics-auth posture in the boot log (LOW-5, MEDIUM-3/4).
+  app.log.info(
+    {
+      bigClaimThresholdMario: config.bigClaimThresholdMario.toString(),
+      trustProxy: String(config.trustProxy ?? false),
+      metricsAuth: config.metricsAuthToken
+        ? "bearer"
+        : config.network === "localnet"
+          ? "open(localnet)"
+          : "forbidden(no-token)",
+    },
+    "claims service effective safety config",
+  );
+
   const shutdown = async (signal: string): Promise<void> => {
     app.log.info({ signal }, "shutting down");
     await app.close();

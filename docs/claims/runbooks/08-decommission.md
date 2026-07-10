@@ -17,7 +17,7 @@ executable checklist — tick each box.
 - [ ] Publish **final claim stats**: total claimed vs. outstanding, by asset type.
       Source of truth:
       ```bash
-      yarn ops:metrics | jq '{claims: .claims.byStatus, liabilities: .liabilities, dispatch: .dispatch}'
+      yarn --silent ops:metrics | jq '{claims: .snapshot.claims.byStatus, liabilities: .snapshot.liabilities, dispatch: .snapshot.dispatch}'
       ```
 - [ ] Publish a fresh signed ledger + anchor (runbook 06) so the pre-close state
       is externally fixed.
@@ -48,7 +48,7 @@ executable checklist — tick each box.
       nothing to sweep. Confirm ownership is intact (spot-check on-chain / the
       reserves ANT count).
 - [ ] Confirm the float is 0 and the cold reserve holds everything:
-      `yarn ops:metrics | jq '.snapshot.float, .snapshot.reserves'`.
+      `yarn --silent ops:metrics | jq '.snapshot.float, .snapshot.reserves'`.
 
 ## Final reconciliation + accounting report
 

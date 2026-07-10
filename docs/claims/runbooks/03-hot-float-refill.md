@@ -12,7 +12,7 @@ this bound only holds if you keep the float small and top up manually.
 
 Read the live float:
 ```bash
-yarn ops:metrics | jq '.snapshot.float, {alerts: .alerts}'
+yarn --silent ops:metrics | jq '.snapshot.float, {alerts: .alerts}'
 # balanceMario / availableMario / capMario / refillNeeded / overCap
 ```
 
@@ -27,7 +27,7 @@ yarn ops:metrics | jq '.snapshot.float, {alerts: .alerts}'
 1. **Compute the amount.** Target the float back to ~cap, but never exceed it:
    `topUp = capMario − balanceMario` (leave headroom; do not overshoot the cap or
    you trip `float-over-cap`). Sanity-check against the outstanding liability
-   (`yarn ops:metrics | jq '.snapshot.liabilities'`).
+   (`yarn --silent ops:metrics | jq '.snapshot.liabilities'`).
 2. **Two operators.** One prepares, one reviews the destination = the **treasury
    ATA** (the ATA of `TREASURY_ADDRESS` for `ARIO_MINT`) and the amount. A wrong
    destination here is a fund loss.
@@ -37,7 +37,7 @@ yarn ops:metrics | jq '.snapshot.float, {alerts: .alerts}'
    normal signing path — this service does **not** hold the cold key.)
 4. **Verify on-chain.** Re-read the float:
    ```bash
-   yarn ops:metrics | jq '.snapshot.float'
+   yarn --silent ops:metrics | jq '.snapshot.float'
    # balanceMario back near cap; refillNeeded=false; overCap=false
    ```
 5. **Audit.** Record the transfer tx signature + operators in the ops log. (The

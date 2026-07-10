@@ -82,31 +82,41 @@ export async function appendAudit(client: PoolClient, entry: AuditEntry): Promis
 
   const record = { ts: new Date().toISOString(), ...entry };
   const json = canonicalJson(record);
-  const entryHash = createHash("sha256")
-    .update(prevHash)
-    .update(Buffer.from(json, "utf8"))
-    .digest();
+  const entryHash = hashCanonical(prevHash, json);
 
   // Sign on write when an audit signer is registered (M6); else placeholder,
   // back-filled by the anchor CLI. Signing over entry_hash (immutable) means a
   // later back-fill produces the identical signature.
   const signature = auditSigner ? auditSigner.signEntryHash(entryHash) : UNSIGNED_PLACEHOLDER;
 
+  // Persist the EXACT canonical bytes in `entry_canonical` (INFO-7). The chain is
+  // verified against those bytes, never a jsonb re-serialization of `entry` (which
+  // is kept only for human/DB readability).
   await client.query(
-    "INSERT INTO audit_log (prev_hash, entry, entry_hash, signature) VALUES ($1, $2::jsonb, $3, $4)",
-    [prevHash, json, entryHash, signature],
+    "INSERT INTO audit_log (prev_hash, entry, entry_hash, signature, entry_canonical) VALUES ($1, $2::jsonb, $3, $4, $5)",
+    [prevHash, json, entryHash, signature, json],
   );
 }
 
 /**
- * Recompute an entry's hash from `prevHash` and the entry object as stored in
- * the `entry` jsonb column. MUST reproduce the bytes `appendAudit` hashed, so it
- * uses the SAME canonical serialization. The verifier (audit-chain.ts) folds
- * this across the whole log to prove linkage independently of the DB.
+ * Hash the EXACT canonical-JSON bytes: `sha256(prevHash || utf8(canonicalJson))`.
+ * The authoritative primitive — `appendAudit` hashes with this over the bytes it
+ * persists in `entry_canonical`, and the verifier re-hashes those same bytes. No
+ * jsonb round-trip is involved (INFO-7).
+ */
+export function hashCanonical(prevHash: Buffer, canonicalJsonStr: string): Buffer {
+  return createHash("sha256").update(prevHash).update(Buffer.from(canonicalJsonStr, "utf8")).digest();
+}
+
+/**
+ * LEGACY fallback: recompute an entry's hash from `prevHash` and the entry object
+ * as stored in the `entry` jsonb column, re-serializing with the SAME canonical
+ * form. Used by the verifier ONLY for pre-INFO-7 rows that have no
+ * `entry_canonical` bytes. Fragile if a future entry carried a float/bignum/dup
+ * key — which is exactly why new rows hash `entry_canonical` directly instead.
  */
 export function computeEntryHash(prevHash: Buffer, entry: unknown): Buffer {
-  const json = canonicalJson(entry);
-  return createHash("sha256").update(prevHash).update(Buffer.from(json, "utf8")).digest();
+  return hashCanonical(prevHash, canonicalJson(entry));
 }
 
 export { canonicalJson, canonicalJson as _canonicalJsonForTest };

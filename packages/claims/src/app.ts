@@ -30,9 +30,12 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
       config.logLevel === "silent"
         ? false
         : { level: config.logLevel },
-    // Trust the reverse proxy (same posture as the attestor) so client
-    // IPs / rate-limit keys are correct behind a load balancer.
-    trustProxy: true,
+    // XFF trust posture — drives which client IP the rate limiter keys on.
+    // DEFAULT `false`: a directly reachable listener uses the socket peer IP and
+    // cannot be spoofed via `X-Forwarded-For` (per-IP rate-limit bypass, MEDIUM-3).
+    // Set `TRUST_PROXY` to the specific proxy hop/CIDR when behind a WAF/LB that
+    // OVERWRITES XFF; blanket `true` is discouraged. See config.ts.
+    trustProxy: config.trustProxy,
   });
 
   // GET /health — liveness. ALWAYS 200 while the process is up, so an

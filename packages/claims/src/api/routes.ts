@@ -12,6 +12,8 @@
 //! HTTP mapping. The business logic + concurrency defense live in `service.ts`;
 //! this module is transport only.
 
+import { timingSafeEqual } from "node:crypto";
+import { Buffer } from "node:buffer";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Config } from "../config.js";
@@ -66,6 +68,38 @@ function enforceIdentity(limiters: RateLimiters, key: string): void {
   if (!d.allowed) {
     throw new ApiError(429, "RATE_LIMITED", `too many requests for this identity; retry in ${Math.ceil(d.retryAfterMs / 1000)}s`);
   }
+}
+
+/** Constant-time string compare (equal-length only; length is not secret here). */
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+/**
+ * Gate the ops `/metrics*` endpoints (they leak float / reserves / liabilities).
+ * A real enforced boundary, not a comment (MEDIUM-4):
+ *   - `METRICS_AUTH_TOKEN` set  -> require `Authorization: Bearer <token>` (401 otherwise).
+ *   - unset + `localnet`        -> allowed (dev convenience).
+ *   - unset + any real network  -> 403 (must set a token or bind ops separately).
+ */
+function enforceMetricsAccess(config: Config, req: FastifyRequest): void {
+  const token = config.metricsAuthToken;
+  if (token) {
+    const auth = req.headers.authorization;
+    if (typeof auth !== "string" || !safeEqual(auth, `Bearer ${token}`)) {
+      throw new ApiError(401, "UNAUTHORIZED", "metrics require a valid bearer token");
+    }
+    return;
+  }
+  if (config.network === "localnet") return;
+  throw new ApiError(
+    403,
+    "METRICS_FORBIDDEN",
+    "metrics are ops-only: set METRICS_AUTH_TOKEN (bearer) or expose them on a separate ops listener",
+  );
 }
 
 export function registerClaimsRoutes(app: FastifyInstance, deps: ClaimsRoutesDeps): void {
@@ -208,13 +242,15 @@ export function registerClaimsRoutes(app: FastifyInstance, deps: ClaimsRoutesDep
     }
   });
 
-  // --- Ops metrics (M7) — NOT under /v1 (so it's not IP-rate-limited); serve
-  //     from the ops network / behind the reverse proxy. Public aggregate data.
+  // --- Ops metrics (M7) — NOT under /v1 (so it's not IP-rate-limited). These
+  //     leak float / reserves / liabilities, so access is ENFORCED (bearer token
+  //     on real networks), not merely "serve from the ops network" (MEDIUM-4).
   const metricsDeps = { pool, config, tconfig, ensureChain: ensureReservesChain };
 
   // GET /metrics — Prometheus text exposition.
-  app.get("/metrics", async (_req, reply) => {
+  app.get("/metrics", async (req, reply) => {
     try {
+      enforceMetricsAccess(config, req);
       reply.header("content-type", "text/plain; version=0.0.4; charset=utf-8");
       reply.send(await getMetricsPrometheus(metricsDeps));
     } catch (e) {
@@ -223,8 +259,9 @@ export function registerClaimsRoutes(app: FastifyInstance, deps: ClaimsRoutesDep
   });
 
   // GET /metrics.json — full JSON snapshot + firing alerts + overall level.
-  app.get("/metrics.json", async (_req, reply) => {
+  app.get("/metrics.json", async (req, reply) => {
     try {
+      enforceMetricsAccess(config, req);
       const { snapshot, alerts, alertLevel } = await getMetricsResult(metricsDeps);
       reply.send({ ...snapshot, alertLevel, alerts });
     } catch (e) {

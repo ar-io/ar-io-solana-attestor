@@ -20,14 +20,17 @@ import {
 
 const HAS_DB = !!process.env.DATABASE_URL;
 
+const OPS_TOKEN = "test-ops-token";
 function cfg(over: Partial<Config> = {}): Config {
   return {
     port: 0, host: "127.0.0.1", logLevel: "silent", network: "solana-mainnet",
     databaseUrl: process.env.DATABASE_URL ?? "", solanaRpcUrl: "http://127.0.0.1:8899",
     challengeTtlMs: 900_000, bigClaimThresholdMario: 100_000_000_000n,
-    rateLimitPerMin: 100_000, rateLimitIdentityPerMin: 100_000, corsOrigin: "*", ...over,
+    rateLimitPerMin: 100_000, rateLimitIdentityPerMin: 100_000, corsOrigin: "*",
+    metricsAuthToken: OPS_TOKEN, ...over,
   };
 }
+const OPS_AUTH = { authorization: `Bearer ${OPS_TOKEN}` };
 
 describe("claims HTTP routes", { skip: HAS_DB ? false : "DATABASE_URL not set" }, () => {
   let db: Db;
@@ -131,18 +134,18 @@ describe("claims HTTP routes", { skip: HAS_DB ? false : "DATABASE_URL not set" }
     await app.close();
   });
 
-  it("serves ops /metrics (Prometheus) and /metrics.json (snapshot + alerts)", async (t) => {
+  it("serves ops /metrics (Prometheus) and /metrics.json (snapshot + alerts) to a bearer", async (t) => {
     if (!usable) return t.skip("M3 schema not migrated");
     const app = buildApp({ config: cfg(), db, limiters: createRateLimiters({ windowMs: 60_000, ipLimit: 100_000, identityLimit: 100_000 }) });
     await app.ready();
 
-    const prom = await app.inject({ method: "GET", url: "/metrics" });
+    const prom = await app.inject({ method: "GET", url: "/metrics", headers: OPS_AUTH });
     assert.equal(prom.statusCode, 200);
     assert.match(prom.headers["content-type"] as string, /text\/plain/);
     assert.match(prom.body, /^claims_up 1$/m);
     assert.match(prom.body, /claims_dispatch_drift_mario /);
 
-    const json = await app.inject({ method: "GET", url: "/metrics.json" });
+    const json = await app.inject({ method: "GET", url: "/metrics.json", headers: OPS_AUTH });
     assert.equal(json.statusCode, 200);
     const body = json.json();
     assert.ok(body.claims && body.dispatch && body.liabilities, "snapshot blocks present");
@@ -153,10 +156,31 @@ describe("claims HTTP routes", { skip: HAS_DB ? false : "DATABASE_URL not set" }
     const app2 = buildApp({ config: cfg(), db, limiters: createRateLimiters({ windowMs: 60_000, ipLimit: 1, identityLimit: 1 }) });
     await app2.ready();
     for (let i = 0; i < 5; i++) {
-      const r = await app2.inject({ method: "GET", url: "/metrics" });
+      const r = await app2.inject({ method: "GET", url: "/metrics", headers: OPS_AUTH });
       assert.equal(r.statusCode, 200, "metrics never rate-limited");
     }
     await app2.close();
     await app.close();
+  });
+
+  it("MEDIUM-4: refuses unauthenticated /metrics + /metrics.json", async (t) => {
+    if (!usable) return t.skip("M3 schema not migrated");
+    // Token configured -> missing/wrong bearer is 401.
+    const app = buildApp({ config: cfg(), db, limiters: createRateLimiters({ windowMs: 60_000, ipLimit: 100_000, identityLimit: 100_000 }) });
+    await app.ready();
+    for (const url of ["/metrics", "/metrics.json"]) {
+      const noAuth = await app.inject({ method: "GET", url });
+      assert.equal(noAuth.statusCode, 401, `${url} must reject a missing bearer`);
+      const badAuth = await app.inject({ method: "GET", url, headers: { authorization: "Bearer wrong" } });
+      assert.equal(badAuth.statusCode, 401, `${url} must reject a wrong bearer`);
+    }
+    await app.close();
+
+    // No token configured on a REAL network -> 403 (enforced boundary, not a comment).
+    const app2 = buildApp({ config: cfg({ metricsAuthToken: undefined, network: "solana-mainnet" }), db, limiters: createRateLimiters({ windowMs: 60_000, ipLimit: 100_000, identityLimit: 100_000 }) });
+    await app2.ready();
+    const forbidden = await app2.inject({ method: "GET", url: "/metrics.json" });
+    assert.equal(forbidden.statusCode, 403, "real network without a token must refuse metrics");
+    await app2.close();
   });
 });

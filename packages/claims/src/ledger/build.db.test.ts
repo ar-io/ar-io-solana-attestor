@@ -6,6 +6,7 @@ import { strict as assert } from "node:assert";
 import { after, before, describe, it } from "node:test";
 import { deriveRecipientIdB64Url } from "@ar.io/attestor-canonical";
 import { createDb, type Db } from "../db.js";
+import { getClaimable } from "../api/service.js";
 import { builtSetFromDb } from "../reconcile/reconcile.js";
 import { writeLedger } from "./build.js";
 import type { LedgerPlan, PlannedAsset, PlannedRecipient } from "./types.js";
@@ -137,5 +138,122 @@ describe("writeLedger <-> builtSetFromDb round-trip", { skip: HAS_DB ? false : "
       [K_TOK],
     );
     assert.equal(before.rows[0].nonce.equals(afterQ.rows[0].nonce), true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HIGH-1: a rebuild must NEVER resurrect a dispensed/live asset (double payout).
+// ---------------------------------------------------------------------------
+const H1_MOD = new Uint8Array(512).fill(7);
+const H1_AR = deriveRecipientIdB64Url(H1_MOD);
+const H1_K_CLAIMED = "test_high1_claimed_" + "33".repeat(22);
+const H1_K_AVAIL = "test_high1_avail_" + "44".repeat(23);
+
+function high1Plan(): LedgerPlan {
+  const recipients: PlannedRecipient[] = [
+    { sourceAddress: H1_AR, protocol: 0, recipientPubkey: H1_MOD, recipientId: H1_AR, status: "open" },
+  ];
+  const assets: PlannedAsset[] = [
+    {
+      assetKey: H1_K_CLAIMED, assetType: "token", recipientSource: H1_AR, antMint: null,
+      amount: 42_000_000n, vaultEndTs: null, status: "available",
+      source: { phase: "token", arweaveAddress: H1_AR, onchainSeed: "escrow_token" },
+    },
+    {
+      assetKey: H1_K_AVAIL, assetType: "token", recipientSource: H1_AR, antMint: null,
+      amount: 9_000_000n, vaultEndTs: null, status: "available",
+      source: { phase: "token", arweaveAddress: H1_AR, onchainSeed: "escrow_token" },
+    },
+  ];
+  return {
+    recipients, assets,
+    counters: { ant: 0, tokenEscrowed: 2, vaultEscrowed: 0, stakeEscrowed: 0 },
+    phase2TokenOutflowMario: 51_000_000n,
+    atRiskRecipientCount: 0,
+    inputFingerprints: {},
+    nowMs: 1783641600000,
+  };
+}
+
+describe("writeLedger rebuild-safety (HIGH-1: no double dispense)", { skip: HAS_DB ? false : "DATABASE_URL not set" }, () => {
+  let db: Db;
+  let usable = false;
+
+  before(async () => {
+    db = createDb(process.env.DATABASE_URL!);
+    try {
+      const r = await db.pool.query("SELECT to_regclass('public.assets') a");
+      usable = !!r.rows[0].a;
+    } catch {
+      usable = false;
+    }
+  });
+
+  after(async () => {
+    if (db) {
+      try {
+        await db.pool.query("DELETE FROM assets WHERE asset_key = ANY($1)", [[H1_K_CLAIMED, H1_K_AVAIL]]);
+        await db.pool.query("DELETE FROM recipients WHERE recipient_id = $1", [H1_AR]);
+      } catch { /* best-effort */ }
+      await db.close();
+    }
+  });
+
+  it("HARD-REFUSES a default rebuild and leaves a claimed asset claimed + unoffered", async (t) => {
+    if (!usable) return t.skip("schema not migrated (run yarn migrate:up)");
+
+    // Clean slate (a prior crashed run could leave a stale live row on our keys).
+    await db.pool.query("DELETE FROM assets WHERE asset_key = ANY($1)", [[H1_K_CLAIMED, H1_K_AVAIL]]);
+
+    // Seed the ledger, then simulate a claim having been dispensed.
+    await writeLedger(db.pool, high1Plan());
+    await db.pool.query("UPDATE assets SET status = 'claimed' WHERE asset_key = $1", [H1_K_CLAIMED]);
+
+    // A blind rebuild (fresh plan marks it 'available' again) must be REFUSED.
+    await assert.rejects(
+      () => writeLedger(db.pool, high1Plan()),
+      /refusing to rebuild the ledger/i,
+      "rebuild against a live/claimed ledger must throw",
+    );
+
+    // The refuse rolled back before any write — the asset is STILL claimed.
+    const after1 = await db.pool.query<{ status: string }>(
+      "SELECT status FROM assets WHERE asset_key = $1",
+      [H1_K_CLAIMED],
+    );
+    assert.equal(after1.rows[0].status, "claimed", "claimed asset must not be reset to available");
+
+    // getClaimable must not re-offer the dispensed asset.
+    const claimable = await getClaimable(db.pool, { recipientId: H1_AR });
+    assert.equal(
+      claimable.assets.some((a) => a.assetKey === H1_K_CLAIMED),
+      false,
+      "a claimed asset must never appear in getClaimable",
+    );
+  });
+
+  it("even a force-allowed rebuild preserves the claimed asset (status-scoped upsert)", async (t) => {
+    if (!usable) return t.skip("schema not migrated");
+
+    // Force the rebuild past guard 1; guard 2 (WHERE-scoped upsert) must still
+    // leave the claimed row intact while refreshing the buildable one.
+    const res = await writeLedger(db.pool, high1Plan(), { allowLiveRebuild: true });
+    assert.equal(res.assetsWritten, 2);
+
+    const claimed = await db.pool.query<{ status: string }>(
+      "SELECT status FROM assets WHERE asset_key = $1",
+      [H1_K_CLAIMED],
+    );
+    assert.equal(claimed.rows[0].status, "claimed", "force-allowed rebuild must NOT regress a claimed asset");
+
+    const avail = await db.pool.query<{ status: string }>(
+      "SELECT status FROM assets WHERE asset_key = $1",
+      [H1_K_AVAIL],
+    );
+    assert.equal(avail.rows[0].status, "available", "an untouched buildable asset stays available");
+
+    const claimable = await getClaimable(db.pool, { recipientId: H1_AR });
+    assert.equal(claimable.assets.some((a) => a.assetKey === H1_K_CLAIMED), false);
+    assert.equal(claimable.assets.some((a) => a.assetKey === H1_K_AVAIL), true);
   });
 });

@@ -5,11 +5,21 @@
 //!   ANT_MINT_SECRET="<base64>" \
 //!   DATABASE_URL=postgres://claims:claims@localhost:5432/claims \
 //!   [LEDGER_NOW_MS=1783641600000] \
+//!   [ALLOW_LIVE_LEDGER_REBUILD=1] \
 //!   node dist/cli/build-ledger.js         (or: tsx src/cli/build-ledger.ts)
 //!
-//! Runs the migrations first (`yarn migrate:up`), then this. Deterministic:
-//! same inputs + same LEDGER_NOW_MS -> same recipients/assets (only nonces are
-//! random, and they are preserved across re-runs).
+//! Runs the migrations first (`yarn migrate:up`), then this. Deterministic for a
+//! PRE-LAUNCH ledger: same inputs + same LEDGER_NOW_MS -> same recipients/assets
+//! (only nonces are random, and they are preserved across re-runs).
+//!
+//! NOT safe to re-run blindly against a LIVE ledger. A fresh plan marks every
+//! asset `available`, so a rebuild would try to reset an already-`claiming` /
+//! `pending_review` / `claimed` asset back to claimable → double payout.
+//! `writeLedger` therefore HARD-REFUSES (throws) if any asset has left the
+//! buildable set. Rebuild only against a ledger with no live claims. For a
+//! deliberate, status-safe refresh of the buildable rows AFTER claims have begun,
+//! set `ALLOW_LIVE_LEDGER_REBUILD=1`: the refuse is skipped but live/terminal rows
+//! are still preserved untouched (only `available`/`manual_review` rows update).
 
 import { loadConfig } from "../config.js";
 import { createDb } from "../db.js";
@@ -54,10 +64,18 @@ async function main(): Promise<void> {
       `AT-RISK(manual_review)=${plan.atRiskRecipientCount}`,
   );
 
+  const allowLiveRebuild = process.env.ALLOW_LIVE_LEDGER_REBUILD === "1";
+  if (allowLiveRebuild) {
+    console.log(
+      "[build-ledger] ALLOW_LIVE_LEDGER_REBUILD=1 — live-ledger refuse is SKIPPED " +
+        "(live/terminal assets are still preserved; only buildable rows update).",
+    );
+  }
+
   const config = loadConfig();
   const db = createDb(config.databaseUrl);
   try {
-    const res = await writeLedger(db.pool, plan);
+    const res = await writeLedger(db.pool, plan, { allowLiveRebuild });
     console.log(
       `[build-ledger] persisted: recipients=${res.recipientsWritten} ` +
         `assets=${res.assetsWritten} (available=${res.availableAssets}, ` +

@@ -35,6 +35,25 @@ export interface Config {
   rateLimitIdentityPerMin: number;
   /** M3: value for the Access-Control-Allow-Origin header ("*" or an origin). */
   corsOrigin: string;
+  /**
+   * Fastify `trustProxy` posture (drives which client IP the rate limiter keys
+   * on). Default `false` — the socket peer IP is authoritative, so a directly
+   * reachable listener can NOT be spoofed via `X-Forwarded-For`. Set `TRUST_PROXY`
+   * to the trusted proxy hop count, `loopback`, or the specific proxy IP/CIDR
+   * (comma-separated allowed) so XFF is honored ONLY from that hop. The fronting
+   * WAF/proxy MUST overwrite (not append) `X-Forwarded-For`. Blanket `true` is
+   * discouraged (it trusts XFF from anyone) — see MEDIUM-3.
+   * Optional so bare test Config literals default to Fastify's `false`.
+   */
+  trustProxy?: boolean | string | number;
+  /**
+   * Bearer token gating `/metrics` + `/metrics.json` (ops-only, leaks
+   * float/reserves/liabilities). When set, requests must carry
+   * `Authorization: Bearer <token>`. When UNSET, metrics are served unauthenticated
+   * ONLY on `localnet`; on any real network the endpoints are refused (403) so the
+   * ops boundary is enforced, not merely documented (MEDIUM-4).
+   */
+  metricsAuthToken?: string;
 }
 
 export type Network = "solana-mainnet" | "solana-devnet" | "localnet";
@@ -79,9 +98,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
 
   // 100,000 ARIO = 100_000 * ONE_TOKEN(1e6) mARIO.
+  // A value of 0 would DISABLE the whale brake (the >threshold gates are
+  // `threshold > 0n`), silently auto-dispensing arbitrarily large claims — reject
+  // it. To route everything to manual review instead, set a threshold of 1.
   const bigClaimThresholdMario = BigInt(env.BIG_CLAIM_THRESHOLD_MARIO ?? "100000000000");
-  if (bigClaimThresholdMario < 0n) {
-    throw new Error(`BIG_CLAIM_THRESHOLD_MARIO must be >= 0, got "${env.BIG_CLAIM_THRESHOLD_MARIO}"`);
+  if (bigClaimThresholdMario <= 0n) {
+    throw new Error(
+      `BIG_CLAIM_THRESHOLD_MARIO must be a positive integer (0 would disable the ` +
+        `whale brake and auto-dispense any amount); got "${env.BIG_CLAIM_THRESHOLD_MARIO}". ` +
+        `Use 1 to route every claim to manual review.`,
+    );
   }
 
   return {
@@ -96,5 +122,25 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     rateLimitPerMin: parseInt(env.RATE_LIMIT_PER_MIN ?? "60", 10),
     rateLimitIdentityPerMin: parseInt(env.RATE_LIMIT_IDENTITY_PER_MIN ?? "20", 10),
     corsOrigin: env.CORS_ORIGIN ?? "*",
+    trustProxy: parseTrustProxy(env.TRUST_PROXY),
+    metricsAuthToken: env.METRICS_AUTH_TOKEN && env.METRICS_AUTH_TOKEN.length > 0 ? env.METRICS_AUTH_TOKEN : undefined,
   };
+}
+
+/**
+ * Parse `TRUST_PROXY` into a Fastify `trustProxy` value. Default (unset/empty/
+ * false) is `false` — do NOT trust `X-Forwarded-For`, key the rate limiter on the
+ * socket peer IP. A hop count, `loopback`, or an explicit IP/CIDR (comma-separated)
+ * scopes XFF trust to that proxy. Blanket `true` is accepted only if explicitly
+ * requested and is discouraged (MEDIUM-3).
+ */
+export function parseTrustProxy(raw: string | undefined): boolean | string | number {
+  if (raw === undefined) return false;
+  const v = raw.trim();
+  if (v === "") return false;
+  const lower = v.toLowerCase();
+  if (["false", "0", "off", "no"].includes(lower)) return false;
+  if (["true", "on", "yes"].includes(lower)) return true; // blanket trust — discouraged
+  if (/^\d+$/.test(v)) return parseInt(v, 10); // number of proxy hops
+  return v; // "loopback" | IP | CIDR | comma-separated list — Fastify parses it
 }

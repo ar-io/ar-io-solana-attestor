@@ -17,7 +17,7 @@
 import { Buffer } from "node:buffer";
 import type { Pool, PoolClient } from "pg";
 
-import { computeEntryHash, UNSIGNED_PLACEHOLDER } from "../api/audit.js";
+import { computeEntryHash, hashCanonical, UNSIGNED_PLACEHOLDER } from "../api/audit.js";
 import { verifyEd25519, type TransparencyKeypair } from "./keys.js";
 
 /** A raw audit row as read from Postgres (bytea -> Buffer, bigserial -> string). */
@@ -25,6 +25,12 @@ export interface AuditRow {
   seq: string;
   prevHash: Buffer;
   entry: unknown;
+  /**
+   * Exact canonical-JSON bytes that were hashed (INFO-7). Present for rows written
+   * on/after the `entry_canonical` migration; the verifier hashes THESE. `null`/
+   * `undefined` for legacy rows, which fall back to re-serializing `entry`.
+   */
+  entryCanonical?: string | null;
   entryHash: Buffer;
   signature: Buffer;
 }
@@ -90,7 +96,12 @@ export function verifyAuditChain(
       issues.push(`seq ${row.seq}: prev_hash does not chain to the prior entry_hash`);
       bad = true;
     }
-    const recomputed = computeEntryHash(row.prevHash, row.entry);
+    // Hash the exact stored canonical bytes when present (INFO-7); otherwise fall
+    // back to re-serializing the `entry` jsonb (legacy pre-migration rows).
+    const recomputed =
+      row.entryCanonical != null
+        ? hashCanonical(row.prevHash, row.entryCanonical)
+        : computeEntryHash(row.prevHash, row.entry);
     if (!recomputed.equals(row.entryHash)) {
       issues.push(`seq ${row.seq}: entry_hash mismatch (entry content altered)`);
       bad = true;
@@ -175,7 +186,7 @@ export async function loadAuditRows(
   const since = opts.sinceSeq ?? "0";
   const params: unknown[] = [since];
   let sql =
-    "SELECT seq, prev_hash, entry, entry_hash, signature FROM audit_log WHERE seq > $1 ORDER BY seq ASC";
+    "SELECT seq, prev_hash, entry, entry_canonical, entry_hash, signature FROM audit_log WHERE seq > $1 ORDER BY seq ASC";
   if (opts.limit !== undefined) {
     params.push(opts.limit);
     sql += " LIMIT $2";
@@ -184,6 +195,7 @@ export async function loadAuditRows(
     seq: string;
     prev_hash: Buffer;
     entry: unknown;
+    entry_canonical: string | null;
     entry_hash: Buffer;
     signature: Buffer;
   }>(sql, params);
@@ -191,6 +203,7 @@ export async function loadAuditRows(
     seq: r.seq,
     prevHash: r.prev_hash,
     entry: r.entry,
+    entryCanonical: r.entry_canonical,
     entryHash: r.entry_hash,
     signature: r.signature,
   }));

@@ -15,7 +15,7 @@ operator-only path (they never self-serve; see §AT-RISK).
 
 ```bash
 # Depth + oldest age (published SLA default 24h):
-yarn ops:metrics | jq '.snapshot.claims | {reviewQueueDepth, oldestReviewAgeSec}'
+yarn --silent ops:metrics | jq '.snapshot.claims | {reviewQueueDepth, oldestReviewAgeSec}'
 
 # The pending_review claims (identity, asset, amount, verified proof already on file):
 psql "$DATABASE_URL" -c "
@@ -63,7 +63,7 @@ approve a claim you would reject. Record the decision + rationale in the ops log
 ## Second brake: the outflow rate-limiter
 
 Independent of the per-claim brake, watch the aggregate: a spike in confirmed
-volume (`yarn ops:metrics | jq '.snapshot.claims | {confirmedLastHour, confirmedLast24h}'`)
+volume (`yarn --silent ops:metrics | jq '.snapshot.claims | {confirmedLastHour, confirmedLast24h}'`)
 is a signal to slow down and review even sub-threshold claims. If confirmed volume
 looks anomalous, **freeze the API** (runbook 08 §freeze) and investigate before
 approving more.
