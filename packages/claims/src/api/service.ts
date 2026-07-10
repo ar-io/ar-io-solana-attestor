@@ -209,7 +209,9 @@ function toAssetView(row: AssetRow, nonce: Buffer): AssetView {
 }
 function toRecipientView(row: RecipientRow): RecipientView {
   if (!row.recipient_pubkey) {
-    throw new ApiError(409, "MANUAL_REVIEW", "recipient has no published key (AT-RISK / manual_review)");
+    // AT-RISK / manual_review recipient (no published key). Hide as 404 so
+    // initiate/complete never emit a MANUAL_REVIEW code that confirms existence.
+    throw hiddenAssetError();
   }
   return {
     protocol: row.protocol as 0 | 1,
@@ -219,7 +221,16 @@ function toRecipientView(row: RecipientRow): RecipientView {
   };
 }
 
-/** Map a non-available asset status to the right client-facing conflict. */
+/** The 404 an AT-RISK / operator-held asset shows — byte-identical to a truly
+ *  nonexistent asset (getAsset uses the same shape), so self-serve callers can't
+ *  distinguish "manual_review exists" from "no such asset" (info-leak closed). */
+function hiddenAssetError(): ApiError {
+  return new ApiError(404, "ASSET_NOT_FOUND", "no self-serve asset with that key");
+}
+
+/** Map a non-available asset status to the right client-facing conflict.
+ *  `manual_review` (AT-RISK) is HIDDEN as a 404 rather than a 409 that would
+ *  confirm the asset exists. */
 function unavailableError(status: string): ApiError {
   switch (status) {
     case "claiming":
@@ -228,7 +239,7 @@ function unavailableError(status: string): ApiError {
     case "pending_review":
       return new ApiError(409, "PENDING_REVIEW", "asset is awaiting operator review");
     case "manual_review":
-      return new ApiError(409, "MANUAL_REVIEW", "asset is operator-queue only (AT-RISK)");
+      return hiddenAssetError();
     case "frozen":
       return new ApiError(409, "ASSET_FROZEN", "asset is frozen");
     case "cancelled":
@@ -240,6 +251,7 @@ function unavailableError(status: string): ApiError {
 
 /** Recover the HTTP status a stored rejection code should replay with. */
 function statusForStoredCode(code: string): number {
+  if (code === "ASSET_NOT_FOUND") return 404;
   if (code === "ALREADY_CLAIMED" || code === "NONCE_MISMATCH" || code === "CHALLENGE_EXPIRED") return 409;
   if (code === "MANUAL_REVIEW" || code === "PENDING_REVIEW" || code.startsWith("ASSET_")) return 409;
   if (code === "RSA_SIGNATURE_INVALID" || code === "SIGNATURE_VERIFICATION_FAILED" || code === "ETHEREUM_ADDRESS_MISMATCH") return 401;
@@ -421,6 +433,17 @@ export async function initiateClaim(
     };
   } catch (e) {
     await client.query("ROLLBACK").catch(() => {});
+    // Concurrency-safe idempotent initiate: two initiates sharing one
+    // idempotency_key can both pass the pre-check SELECT, then race the INSERT.
+    // The loser hits the unique constraint (23505) — which only fires AFTER the
+    // winner committed (Postgres blocks the duplicate insert until then), so its
+    // row is now visible. Return the winner's claim, not a 500. (This mirrors
+    // completeClaim's 23505 handling.)
+    if ((e as { code?: string }).code === "23505" && input.idempotencyKey) {
+      const ex = await pool.query<ClaimRow>("SELECT * FROM claims WHERE idempotency_key = $1", [input.idempotencyKey]);
+      if (ex.rows[0]) return initiateResultFromRow(ex.rows[0], config);
+      throw new ApiError(409, "IDEMPOTENCY_KEY_REUSED", "idempotency key is already in use");
+    }
     throw e;
   } finally {
     client.release();
@@ -474,12 +497,18 @@ export async function completeClaim(
     const claim = claimRes.rows[0];
     if (!claim) throw new ApiError(404, "CLAIM_NOT_FOUND", "no such claim");
 
-    // Idempotency: a terminal claim replays its stored outcome, no new work.
+    // Idempotent replay of a completed claim. RE-VERIFY the submitted proof
+    // BEFORE returning any success, so an unauthenticated replay (garbage or
+    // foreign signature) can never read back a "verified"/"pending_review"
+    // (proof-of-auth) response. A legitimate retry resends the same valid proof
+    // and gets the SAME result with no new work / dispatch intent.
     if (claim.status === "verified" || claim.status === "dispatching" || claim.status === "confirmed") {
+      await verifyReplayProof(client, claim, input, config);
       await client.query("COMMIT");
       return { claimId: claim.claim_id, status: "verified", assetKey: claim.asset_key, claimant: claim.claimant, settlement: claim.settlement, idempotentReplay: true };
     }
     if (claim.status === "pending_review") {
+      await verifyReplayProof(client, claim, input, config);
       await client.query("COMMIT");
       return { claimId: claim.claim_id, status: "pending_review", assetKey: claim.asset_key, claimant: claim.claimant, settlement: claim.settlement, idempotentReplay: true };
     }
@@ -677,6 +706,40 @@ async function rejectClaim(client: PoolClient, claim: ClaimRow, code: string, re
     claimant: claim.claimant, recipientId: claim.recipient_id ?? undefined,
     protocol: claim.protocol ?? undefined, status: "rejected", reason: `${code}: ${reason}`,
   });
+}
+
+/**
+ * Re-verify the submitted proof against an ALREADY-COMPLETED claim's stored
+ * identity + challenge (read-only; no state change). Used only on the idempotent
+ * replay path so a `complete` 202 is NEVER returned for a garbage/foreign proof.
+ * Throws the mapped ApiError on any failure; returns void on a valid proof.
+ */
+async function verifyReplayProof(
+  client: PoolClient,
+  claim: ClaimRow,
+  input: CompleteInput,
+  config: Config,
+): Promise<void> {
+  if (!claim.challenge_nonce) {
+    throw new ApiError(422, "INVALID_INPUT", "claim has no challenge to verify against");
+  }
+  const asset = await loadAsset(client, claim.asset_key);
+  if (!asset) throw new ApiError(404, "ASSET_NOT_FOUND", "asset no longer exists");
+  const recipRow = await loadRecipient(client, asset.recipient_id);
+  if (!recipRow) throw new ApiError(404, "RECIPIENT_NOT_FOUND", "recipient missing");
+  const recipient = toRecipientView(recipRow);
+  const proof = buildProof(input.proof, claim.claimant, recipient.protocol, input.nonceHex);
+  try {
+    verifyClaim({
+      recipient,
+      asset: toAssetView(asset, claim.challenge_nonce),
+      proof,
+      network: config.network,
+    });
+  } catch (e) {
+    if (e instanceof VerificationError) throw fromVerificationError(e);
+    throw e;
+  }
 }
 
 /**

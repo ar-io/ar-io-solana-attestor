@@ -632,6 +632,35 @@ claim. Claim: `claiming → verified` (dispatch intent) `| pending_review | reje
 - **Bad proof** → claim `rejected`, asset untouched (never consumed on a failed
   verification); the user re-initiates a fresh challenge.
 
+**A `complete` 202 always means a valid proof was presented (M4/frontend: do NOT
+read it as caller-authentication).** The idempotent-replay path RE-VERIFIES the
+submitted proof against the stored identity + challenge before returning any
+`verified`/`pending_review` — so an unauthenticated replay (garbage or foreign
+signature) gets a 401/422, never a success. A 202 therefore certifies "a valid
+recipient-key proof was presented for this claim"; it does NOT certify the *caller*
+is the recipient — dispensing always goes to the claimant bound INSIDE the
+canonical, exactly as on-chain (anyone may submit). A genuine retry (same valid
+proof) still replays idempotently to the SAME result with no new dispatch intent.
+
+### Post-review fixes (M3 tester round 1)
+
+The tester found no double-dispense path (N=48/64 + 40×64 soak + external-lock +
+connection-kill all held); three non-double-spend defects were fixed here:
+
+- **Concurrency-safe idempotent initiate** (was: HTTP 500 on a lost race). Two
+  initiates sharing one `idempotencyKey` can both pass the pre-check SELECT then
+  race the INSERT; the loser hit the `idempotency_key` unique violation (23505)
+  which surfaced as 500. `initiateClaim` now catches 23505 (only fires *after* the
+  winner committed, so its row is visible) → re-SELECTs and returns the winner's
+  claim (mirrors `completeClaim`'s 23505 handling). Proven: 8-way concurrent
+  initiate on one key → all return the SAME claim, zero failures, one claim row.
+- **Replay re-verification** (see the 202 note above) — the `verified`/
+  `pending_review` idempotent short-circuits now call `verifyReplayProof` first.
+- **AT-RISK existence hidden** — `initiate`/`complete` on a `manual_review`
+  assetKey now return **404 ASSET_NOT_FOUND** (byte-identical to a nonexistent
+  asset), not 409 `MANUAL_REVIEW`. `toRecipientView`'s null-key path is hidden the
+  same way. Matches `getAsset`, closing the existence-confirmation info-leak.
+
 ### Schema changes (`1720000002000_claims_api.sql`)
 
 Assets gain the `claiming` status. Claims gain `challenge_nonce`,
@@ -690,8 +719,14 @@ manual_review=182). Then:
   and 32), replay-across-assets, expired challenge, re-initiate-after-claim, bad
   signature, nonce echo mismatch, big-claim brake → `pending_review`, wrong
   protocol → `PROTOCOL_MISMATCH`.
-- Full suite green: **claims 199** (28 new M3: service.db 12, http 3, rate-limit 6,
-  errors 4, audit 3) + **attestor 11 + canonical 49 unchanged**. Lint/typecheck
+- **Post-review proofs**: 8-way concurrent initiate on one `idempotencyKey` → all
+  return the SAME claim, zero 500s; a garbage/foreign-signature replay of a
+  completed claim → 401 (never `verified`), while the genuine proof still replays
+  idempotently; `initiate` on a `manual_review` asset → 404 (indistinguishable
+  from nonexistent).
+- Full suite green: **claims 219** — 32 M3 tests (service.db 15, http 4,
+  rate-limit 6, errors 4, audit 3) + the tester's `service.adversarial.db.test.ts`
+  (16) + M1/M2 suites, and **attestor 11 + canonical 49 unchanged**. Lint/typecheck
   (incl. `typecheck:tests`) clean. Migration up/down round-trips.
 
 ### What I could NOT fully verify / caveats (M3)

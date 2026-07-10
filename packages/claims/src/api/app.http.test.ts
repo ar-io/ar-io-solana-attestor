@@ -112,4 +112,22 @@ describe("claims HTTP routes", { skip: HAS_DB ? false : "DATABASE_URL not set" }
     assert.ok(codes.includes(429), `expected a 429 within the burst, got ${codes.join(",")}`);
     await app.close();
   });
+
+  it("enforces the per-IDENTITY rate limit independently of IP (429)", async (t) => {
+    if (!usable) return t.skip("M3 schema not migrated");
+    // Generous IP budget, tiny identity budget -> the identity limiter must
+    // fire first for repeated hits to the SAME identity.
+    const app = buildApp({ config: cfg(), db, limiters: createRateLimiters({ windowMs: 60_000, ipLimit: 100_000, identityLimit: 2 }) });
+    await app.ready();
+    const codes: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      const r = await app.inject({ method: "GET", url: "/v1/claimable?recipientId=same-identity" });
+      codes.push(r.statusCode);
+    }
+    assert.ok(codes.includes(429), `expected a per-identity 429, got ${codes.join(",")}`);
+    // A DIFFERENT identity is unaffected by the first one's throttle.
+    const other = await app.inject({ method: "GET", url: "/v1/claimable?recipientId=other-identity" });
+    assert.notEqual(other.statusCode, 429);
+    await app.close();
+  });
 });

@@ -423,4 +423,86 @@ describe("claims API — state machine + concurrency", { skip: HAS_DB ? false : 
     );
     assert.equal(await assetStatus(db, ak), "available");
   });
+
+  // ---- MEDIUM fix: concurrent idempotency-key initiate is race-safe -------
+  it("8 parallel initiates sharing one idempotencyKey -> SAME claim, no 500", async (t) => {
+    if (!usable) return t.skip("M3 schema not migrated");
+    const cfg = testConfig();
+    const id = makeEthIdentity();
+    const ak = tokenKey();
+    track(id.recipientId, ak);
+    await insertRecipient(db.pool, { recipientId: id.recipientId, protocol: 1, sourceAddress: id.addressLower, recipientPubkey: id.address });
+    await insertAsset(db.pool, id.recipientId, { assetKey: ak, assetType: "token", amount: 10n });
+
+    const key = "race-" + uid();
+    const claimant = randomClaimant();
+    const results = await Promise.allSettled(
+      Array.from({ length: 8 }, () => initiateClaim(db.pool, cfg, { assetKey: ak, claimant, idempotencyKey: key })),
+    );
+    // NONE may be a 500; ALL must resolve to the SAME claim id.
+    const rejected = results.filter((r) => r.status === "rejected");
+    assert.equal(rejected.length, 0, `no initiate may fail: ${rejected.map((r) => (r as PromiseRejectedResult).reason?.message).join("; ")}`);
+    const ids = new Set(results.map((r) => (r as PromiseFulfilledResult<{ claimId: string }>).value.claimId));
+    assert.equal(ids.size, 1, "all 8 concurrent initiates must return one shared claim");
+    // Exactly one claim row exists for the key.
+    const rows = await db.pool.query<{ n: string }>("SELECT count(*)::text n FROM claims WHERE idempotency_key=$1", [key]);
+    assert.equal(Number(rows.rows[0].n), 1);
+  });
+
+  // ---- LOW fix: a garbage-signature replay cannot read back "verified" ----
+  it("replaying a completed claim with a garbage signature is REJECTED (not verified)", async (t) => {
+    if (!usable) return t.skip("M3 schema not migrated");
+    const cfg = testConfig();
+    const id = makeEthIdentity();
+    const ak = tokenKey();
+    track(id.recipientId, ak);
+    await insertRecipient(db.pool, { recipientId: id.recipientId, protocol: 1, sourceAddress: id.addressLower, recipientPubkey: id.address });
+    await insertAsset(db.pool, id.recipientId, { assetKey: ak, assetType: "token", amount: 12n });
+
+    const init = await initiateClaim(db.pool, cfg, { assetKey: ak, claimant: randomClaimant() });
+    const goodSig = await signEthCanonical(id.priv, Buffer.from(init.canonicalMessageHex, "hex"));
+    const good = { protocol: "ethereum" as const, signatureHex: Buffer.from(goodSig).toString("hex") };
+
+    // First complete succeeds.
+    assert.equal((await completeClaim(db.pool, cfg, { claimId: init.claimId, proof: good })).status, "verified");
+
+    // Replay with a FOREIGN (different-key) signature -> must NOT be "verified".
+    const foreign = await signEthCanonical(makeEthIdentity().priv, Buffer.from(init.canonicalMessageHex, "hex"));
+    await assert.rejects(
+      completeClaim(db.pool, cfg, { claimId: init.claimId, proof: { protocol: "ethereum", signatureHex: Buffer.from(foreign).toString("hex") } }),
+      (e: unknown) => e instanceof ApiError && e.status === 401,
+      "a garbage/foreign replay must be rejected, never return verified",
+    );
+    // Replay with a structurally-bogus signature -> also rejected, not verified.
+    await assert.rejects(
+      completeClaim(db.pool, cfg, { claimId: init.claimId, proof: { protocol: "ethereum", signatureHex: "11".repeat(65) } }),
+      (e: unknown) => e instanceof ApiError && e.status >= 400 && e.status < 500,
+    );
+    // The GENUINE proof still replays idempotently (same result, no new work).
+    const replay = await completeClaim(db.pool, cfg, { claimId: init.claimId, proof: good });
+    assert.equal(replay.status, "verified");
+    assert.equal(replay.idempotentReplay, true);
+    assert.equal(await countAuditEvents(db, init.claimId, "claim.verified"), 1);
+  });
+
+  // ---- INFO fix: AT-RISK asset hides existence (404, not 409 MANUAL_REVIEW) ---
+  it("initiate on a manual_review asset returns 404 (no existence confirmation)", async (t) => {
+    if (!usable) return t.skip("M3 schema not migrated");
+    const cfg = testConfig();
+    const id = makeEthIdentity();
+    const ak = tokenKey();
+    track(id.recipientId, ak);
+    // AT-RISK-style: recipient has no key; asset flagged manual_review.
+    await db.pool.query(
+      "INSERT INTO recipients (recipient_id, protocol, source_address, recipient_pubkey, status) VALUES ($1,1,$2,NULL,'manual_review')",
+      [id.recipientId, id.addressLower],
+    );
+    await insertAsset(db.pool, id.recipientId, { assetKey: ak, assetType: "token", amount: 6_250_000n, status: "manual_review" });
+
+    await assert.rejects(
+      initiateClaim(db.pool, cfg, { assetKey: ak, claimant: randomClaimant() }),
+      (e: unknown) => e instanceof ApiError && e.status === 404 && e.code === "ASSET_NOT_FOUND",
+      "manual_review must be indistinguishable from a nonexistent asset",
+    );
+  });
 });
