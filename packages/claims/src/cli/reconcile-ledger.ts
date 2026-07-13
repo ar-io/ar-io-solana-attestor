@@ -22,18 +22,27 @@ import { deriveAuthoritativeDeposits } from "../reconcile/authoritative.js";
 import {
   builtSetFromDb,
   builtSetFromPlan,
+  checkVaultStakeMarioGate,
   EXPECTED_GATE,
   gateAppliesAt,
   reconcile,
   type BuiltAsset,
 } from "../reconcile/reconcile.js";
 
-function checkGate(label: string, counters: {
-  ant: number;
-  tokenEscrowed: number;
-  vaultEscrowed: number;
-  stakeEscrowed: number;
-}): string[] {
+function checkGate(
+  label: string,
+  counters: {
+    ant: number;
+    tokenEscrowed: number;
+    vaultEscrowed: number;
+    stakeEscrowed: number;
+  },
+  // Absolute per-phase mARIO totals — pinned in EXPECTED_GATE (MED-C) so a
+  // tampered vault/stake `amountMario` (which slips past the count-only pins
+  // and the bit-exact diff, since both sides read the same poisoned file) is
+  // caught here on whichever derivation supplies these totals.
+  mario: { vaultMario: bigint; stakeMario: bigint },
+): string[] {
   const fails: string[] = [];
   const g = EXPECTED_GATE;
   const cmp = (name: string, got: number, exp: number): void => {
@@ -45,6 +54,7 @@ function checkGate(label: string, counters: {
   cmp("stakeEscrowed", counters.stakeEscrowed, g.stakeEscrowed);
   const total = counters.ant + counters.tokenEscrowed + counters.vaultEscrowed + counters.stakeEscrowed;
   cmp("total", total, g.total);
+  fails.push(...checkVaultStakeMarioGate(label, mario.vaultMario, mario.stakeMario));
   return fails;
 }
 
@@ -94,8 +104,17 @@ async function main(): Promise<void> {
       `token=${authoritative.onchainSeedCounts.token} vault=${authoritative.onchainSeedCounts.vault} ` +
       `total=${authoritative.deposits.size}`,
   );
+  console.log(
+    `authoritative phase mARIO: vault=${authoritative.phase3VaultMario} ` +
+      `stake=${authoritative.phase4StakeMario}`,
+  );
   if (gateApplies) {
-    fails.push(...checkGate("authoritative", authoritative.counters));
+    fails.push(
+      ...checkGate("authoritative", authoritative.counters, {
+        vaultMario: authoritative.phase3VaultMario,
+        stakeMario: authoritative.phase4StakeMario,
+      }),
+    );
     if (authoritative.phase2TokenOutflowMario !== EXPECTED_GATE.phase2TokenOutflowMario) {
       fails.push(
         `authoritative.phase2TokenOutflow: got ${authoritative.phase2TokenOutflowMario}, ` +
@@ -116,12 +135,20 @@ async function main(): Promise<void> {
     `built recipients=${plan.recipients.length} assets=${plan.assets.length} ` +
       `AT-RISK(manual_review)=${plan.atRiskRecipientCount}`,
   );
+  console.log(
+    `built phase mARIO: vault=${plan.phase3VaultMario} stake=${plan.phase4StakeMario}`,
+  );
   // AT-RISK count is nowMs-independent — always checked.
   if (plan.atRiskRecipientCount !== EXPECTED_GATE.atRisk) {
     fails.push(`AT-RISK count: got ${plan.atRiskRecipientCount}, expected ${EXPECTED_GATE.atRisk}`);
   }
   if (gateApplies) {
-    fails.push(...checkGate("built", plan.counters));
+    fails.push(
+      ...checkGate("built", plan.counters, {
+        vaultMario: plan.phase3VaultMario,
+        stakeMario: plan.phase4StakeMario,
+      }),
+    );
     if (plan.phase2TokenOutflowMario !== EXPECTED_GATE.phase2TokenOutflowMario) {
       fails.push(
         `built.phase2TokenOutflow: got ${plan.phase2TokenOutflowMario}, ` +

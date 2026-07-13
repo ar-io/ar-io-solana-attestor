@@ -137,6 +137,37 @@ describe("buildLedgerPlan (synthetic four-phase fixture)", () => {
     assert.equal(typeof plan.phase2TokenOutflowMario, "bigint");
   });
 
+  it("phase-3 vault + phase-4 stake mARIO absolute totals (MED-C)", () => {
+    // vault (every deposited vault, regardless of routing):
+    //   v-active 200M + v-expired 50M + v-short 300M + v-submin 50M = 600M
+    assert.equal(plan.phase3VaultMario, 600_000_000n);
+    // stake: operator vault 10.001B + delegator liquid 3M = 10.004B
+    assert.equal(plan.phase4StakeMario, 10_004_000_000n);
+    assert.equal(typeof plan.phase3VaultMario, "bigint");
+    assert.equal(typeof plan.phase4StakeMario, "bigint");
+  });
+
+  it("tamper: an inflated VAULT amount shifts phase3VaultMario but NOT the counts (MED-C)", () => {
+    // The exact gap MED-C closes: an insider inflates a raw-vaults.json balance.
+    // The builder AND the authoritative reconciler read the same poisoned file,
+    // so the bit-exact diff still matches; the vault COUNT is unchanged, so the
+    // count-only gate passes. Only the absolute mARIO pin moves — and catches it.
+    const tampered = fixture();
+    tampered.vaults[O1.addr]["v-active"].balance += 1_000_000_000;
+    const p = buildLedgerPlan(tampered, { antMintSecret: ANT_MINT_TEST_SECRET, nowMs: NOW_MS });
+    assert.deepEqual(p.counters, plan.counters); // count-blind
+    assert.equal(p.phase3VaultMario, plan.phase3VaultMario + 1_000_000_000n); // pin catches it
+  });
+
+  it("tamper: an inflated STAKE amount shifts phase4StakeMario but NOT the counts (MED-C)", () => {
+    const tampered = fixture();
+    const ov = tampered.plan.plans.stakePlan.operatorEscrowVaults[0];
+    ov.amountMario = (BigInt(ov.amountMario) + 2_000_000_000n).toString();
+    const p = buildLedgerPlan(tampered, { antMintSecret: ANT_MINT_TEST_SECRET, nowMs: NOW_MS });
+    assert.deepEqual(p.counters, plan.counters); // count-blind
+    assert.equal(p.phase4StakeMario, plan.phase4StakeMario + 2_000_000_000n); // pin catches it
+  });
+
   it("money is integer bigint everywhere (never float)", () => {
     for (const a of plan.assets) {
       if (a.assetType === "ant") assert.equal(a.amount, null);

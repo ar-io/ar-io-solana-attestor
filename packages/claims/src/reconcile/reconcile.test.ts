@@ -1,7 +1,13 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import type { AuthoritativeResult } from "./authoritative.js";
-import { type BuiltAsset, EXPECTED_GATE, gateAppliesAt, reconcile } from "./reconcile.js";
+import {
+  type BuiltAsset,
+  checkVaultStakeMarioGate,
+  EXPECTED_GATE,
+  gateAppliesAt,
+  reconcile,
+} from "./reconcile.js";
 
 function auth(
   deposits: Array<[string, { assetType: "ant" | "token" | "vault"; amount: bigint | null; recipientHex: string }]>,
@@ -15,6 +21,8 @@ function auth(
     deposits: map,
     counters: { ant: 0, tokenEscrowed: 0, vaultEscrowed: 0, stakeEscrowed: 0 },
     phase2TokenOutflowMario: 0n,
+    phase3VaultMario: 0n,
+    phase4StakeMario: 0n,
     onchainSeedCounts: seed,
     importSrc: "(test)",
   };
@@ -84,8 +92,50 @@ describe("reconcile() diff engine", () => {
     assert.equal(EXPECTED_GATE.nowMs, 1783641600000);
   });
 
+  it("EXPECTED_GATE pins absolute vault + stake mARIO (MED-C)", () => {
+    // Captured from the canonical frozen dir; nowMs-independent absolutes.
+    assert.equal(EXPECTED_GATE.expectedVaultMario, 20629353000000n);
+    assert.equal(EXPECTED_GATE.expectedStakeMario, 4382868348396n);
+    assert.equal(typeof EXPECTED_GATE.expectedVaultMario, "bigint");
+    // Σ available = phase2 + vault + stake = 73,277,178.580427 ARIO.
+    assert.equal(
+      EXPECTED_GATE.phase2TokenOutflowMario +
+        EXPECTED_GATE.expectedVaultMario +
+        EXPECTED_GATE.expectedStakeMario,
+      73277178580427n,
+    );
+  });
+
   it("gateAppliesAt: the published oracle is coupled to its reference instant", () => {
     assert.equal(gateAppliesAt(EXPECTED_GATE.nowMs), true);
     assert.equal(gateAppliesAt(EXPECTED_GATE.nowMs + 1), false); // a re-pin -> oracle skipped
+  });
+});
+
+describe("checkVaultStakeMarioGate — catches a tampered vault/stake amount (MED-C)", () => {
+  const V = EXPECTED_GATE.expectedVaultMario;
+  const S = EXPECTED_GATE.expectedStakeMario;
+
+  it("genuine per-phase totals => no failures", () => {
+    assert.deepEqual(checkVaultStakeMarioGate("built", V, S), []);
+  });
+
+  it("an inflated vault amountMario (+1) FAILs the gate", () => {
+    // Pre-fix there was NO absolute vault pin, so inflating a raw-vaults.json
+    // balance passed: the count is unchanged and both builder + authoritative
+    // read the same tampered file, so the bit-exact diff matched too.
+    const fails = checkVaultStakeMarioGate("built", V + 1n, S);
+    assert.equal(fails.length, 1);
+    assert.match(fails[0], /vaultMario/);
+  });
+
+  it("an inflated stake amountMario FAILs the gate", () => {
+    const fails = checkVaultStakeMarioGate("authoritative", V, S + 1_000_000n);
+    assert.equal(fails.length, 1);
+    assert.match(fails[0], /stakeMario/);
+  });
+
+  it("both inflated => two failures", () => {
+    assert.equal(checkVaultStakeMarioGate("built", V + 5n, S + 5n).length, 2);
   });
 });

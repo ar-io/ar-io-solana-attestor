@@ -140,6 +140,10 @@ export function buildLedgerPlan(inputs: FrozenInputs, opts: PlanOptions): Ledger
   const seenKeys = new Set<string>();
   const counters = { ant: 0, tokenEscrowed: 0, vaultEscrowed: 0, stakeEscrowed: 0 };
   let phase2TokenOutflowMario = 0n;
+  // Absolute per-phase mARIO (available/deposited set), for the MED-C gate pins.
+  // nowMs-independent: added regardless of vault-vs-liquid routing.
+  let phase3VaultMario = 0n;
+  let phase4StakeMario = 0n;
 
   const pushAsset = (a: PlannedAsset): void => {
     if (seenKeys.has(a.assetKey)) {
@@ -241,7 +245,10 @@ export function buildLedgerPlan(inputs: FrozenInputs, opts: PlanOptions): Ledger
             onchainSeed: "escrow_token",
           },
         });
-        if (status === "available") counters.tokenEscrowed++;
+        if (status === "available") {
+          counters.tokenEscrowed++;
+          phase3VaultMario += amount;
+        }
         continue;
       }
       const lockDurationSeconds = BigInt(Math.ceil((v.endTimestamp - nowMs) / 1000));
@@ -283,7 +290,10 @@ export function buildLedgerPlan(inputs: FrozenInputs, opts: PlanOptions): Ledger
       }
       // Manifest "vaultEscrowed" counts every active unmapped vault regardless
       // of whether it routed to vault or liquid-fallback.
-      if (status === "available") counters.vaultEscrowed++;
+      if (status === "available") {
+        counters.vaultEscrowed++;
+        phase3VaultMario += amount;
+      }
     }
   }
 
@@ -337,7 +347,10 @@ export function buildLedgerPlan(inputs: FrozenInputs, opts: PlanOptions): Ledger
         },
       });
     }
-    if (status === "available") counters.stakeEscrowed++;
+    if (status === "available") {
+      counters.stakeEscrowed++;
+      phase4StakeMario += v.amountMario;
+    }
   }
 
   for (const l of stakeSet.liquid) {
@@ -357,7 +370,10 @@ export function buildLedgerPlan(inputs: FrozenInputs, opts: PlanOptions): Ledger
         onchainSeed: "escrow_token",
       },
     });
-    if (status === "available") counters.stakeEscrowed++;
+    if (status === "available") {
+      counters.stakeEscrowed++;
+      phase4StakeMario += l.amountMario;
+    }
   }
 
   const atRiskRecipientCount = [...recipients.values()].filter(
@@ -369,6 +385,8 @@ export function buildLedgerPlan(inputs: FrozenInputs, opts: PlanOptions): Ledger
     assets,
     counters,
     phase2TokenOutflowMario,
+    phase3VaultMario,
+    phase4StakeMario,
     atRiskRecipientCount,
     inputFingerprints: inputs.fingerprints,
     nowMs,

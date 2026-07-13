@@ -60,6 +60,19 @@ export interface LedgerPlan {
   counters: ManifestCounters;
   /** Phase-2 token-escrow ARIO outflow (mARIO) — the ~48.3M gate number. */
   phase2TokenOutflowMario: bigint;
+  /**
+   * Phase-3 personal-vault total mARIO (available/deposited set). Sum of every
+   * deposited unmapped vault's balance regardless of vault-vs-liquid routing;
+   * nowMs-independent. Pinned in EXPECTED_GATE (MED-C) to catch a tampered
+   * raw-vaults.json amount that the count-only gate + bit-exact diff would miss.
+   */
+  phase3VaultMario: bigint;
+  /**
+   * Phase-4 stake+withdrawal total mARIO (available/deposited set). Sum of every
+   * deposited stake/withdrawal entry's amountMario; nowMs-independent. Pinned in
+   * EXPECTED_GATE (MED-C) to catch a tampered delivery-escrow-plan.json amount.
+   */
+  phase4StakeMario: bigint;
   atRiskRecipientCount: number;
   /** sha256 fingerprints of every frozen input (audit provenance). */
   inputFingerprints: Record<string, string>;

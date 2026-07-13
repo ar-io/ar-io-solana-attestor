@@ -51,6 +51,10 @@ export interface AuthoritativeResult {
   deposits: Map<string, AuthoritativeDeposit>;
   counters: { ant: number; tokenEscrowed: number; vaultEscrowed: number; stakeEscrowed: number };
   phase2TokenOutflowMario: bigint;
+  /** Phase-3 personal-vault total mARIO (deposited set); nowMs-independent. */
+  phase3VaultMario: bigint;
+  /** Phase-4 stake+withdrawal total mARIO (deposited set); nowMs-independent. */
+  phase4StakeMario: bigint;
   onchainSeedCounts: { ant: number; token: number; vault: number };
   importSrc: string;
 }
@@ -227,6 +231,10 @@ export async function deriveAuthoritativeDeposits(opts: {
   const counters = { ant: 0, tokenEscrowed: 0, vaultEscrowed: 0, stakeEscrowed: 0 };
   const onchainSeedCounts = { ant: 0, token: 0, vault: 0 };
   let phase2 = 0n;
+  // Absolute per-phase mARIO (deposited set) for the MED-C gate pins; added for
+  // every deposited entry regardless of vault-vs-liquid routing (nowMs-stable).
+  let phase3Vault = 0n;
+  let phase4Stake = 0n;
 
   const add = (
     d: AuthoritativeDeposit,
@@ -291,6 +299,7 @@ export async function deriveAuthoritativeDeposits(opts: {
       if (amount <= 0n) continue;
       const pub = depositedRecipient(owner);
       if (!pub) continue;
+      phase3Vault += amount; // deposited regardless of vault-vs-liquid routing
       const assetKey = bytesHex(M.deriveVaultAssetId(owner, vaultId)); // authoritative import
       const recipientHex = bytesHex(pub);
       if (v.endTimestamp <= nowMs) {
@@ -315,6 +324,7 @@ export async function deriveAuthoritativeDeposits(opts: {
   for (const v of set.vaults) {
     const pub = depositedRecipient(v.arweaveAddr);
     if (!pub) continue;
+    phase4Stake += v.amountMario; // deposited regardless of vault-vs-liquid routing
     const assetKey = sha256Hex(v.assetIdSeed);
     const recipientHex = bytesHex(pub);
     let lock = BigInt(v.unlockTs - nowS);
@@ -335,6 +345,7 @@ export async function deriveAuthoritativeDeposits(opts: {
   for (const l of set.liquid) {
     const pub = depositedRecipient(l.arweaveAddr);
     if (!pub) continue;
+    phase4Stake += l.amountMario;
     add(
       {
         assetType: "token",
@@ -347,5 +358,13 @@ export async function deriveAuthoritativeDeposits(opts: {
     counters.stakeEscrowed++;
   }
 
-  return { deposits, counters, phase2TokenOutflowMario: phase2, onchainSeedCounts, importSrc: src };
+  return {
+    deposits,
+    counters,
+    phase2TokenOutflowMario: phase2,
+    phase3VaultMario: phase3Vault,
+    phase4StakeMario: phase4Stake,
+    onchainSeedCounts,
+    importSrc: src,
+  };
 }
