@@ -70,8 +70,10 @@ export function loadDispatchConfig(base: Config, env: NodeJS.ProcessEnv = proces
 
   const floatPolicy = floatPolicyFromEnv(base.bigClaimThresholdMario, env);
 
-  // Live ArioConfig.min/max_vault_duration — the operator sources these from the
-  // on-chain ArioConfig at cutover. Defaults: 14 days min, 365 days max.
+  // ArioConfig.min/max_vault_duration — the operator sets these to the on-chain
+  // values at cutover; the worker boot RECONCILES them against the live on-chain
+  // ArioConfig and fails fast on mismatch (dispatch/ario-config.ts). Defaults: 14
+  // days min, 365 days max.
   const vaultDurations: VaultDurations = {
     minVaultDuration: BigInt(env.VAULT_MIN_DURATION_SECONDS ?? (14 * 86_400).toString()),
     maxVaultDuration: BigInt(env.VAULT_MAX_DURATION_SECONDS ?? (365 * 86_400).toString()),

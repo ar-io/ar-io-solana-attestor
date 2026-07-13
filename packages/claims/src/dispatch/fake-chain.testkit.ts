@@ -14,7 +14,7 @@
 import { Buffer } from "node:buffer";
 import type { Address, IInstruction, TransactionSigner } from "@solana/kit";
 
-import type { ChainGateway, ConfirmState, SignedDispatch } from "./chain.js";
+import type { ChainGateway, ConfirmState, OutflowMatch, OutflowScanParams, SignedDispatch } from "./chain.js";
 
 interface TxState {
   landed: boolean;
@@ -32,6 +32,15 @@ export class FakeChainGateway implements ChainGateway {
   dropBroadcast = false;
   failOnLand = false;
   forcePendingCount = 0;
+  /** The exploit shape (adversarial item A): the confirm-RPC is lagging/pooled
+   *  and MISREPORTS a LANDED tx as `expired` for the next N confirmSignature
+   *  calls. The independent outflow scan (findConfirmedOutflow) must still see the
+   *  landed tx and prevent a re-send. */
+  expiredDespiteLandedCount = 0;
+  /** When true, findConfirmedOutflow always returns null even for a landed tx
+   *  (models a fully-adversarial RPC that ALSO hides history) — used to prove the
+   *  hard re-sign cap bounds the blast radius. */
+  hideOutflows = false;
   /** Hook fired at the START of signTransaction (before the worker persists) —
    *  lets a test flip DB state to exercise the persist-time FOR UPDATE guard. */
   onSign?: () => Promise<void>;
@@ -84,9 +93,27 @@ export class FakeChainGateway implements ChainGateway {
       return "pending";
     }
     const t = this.#txs.get(signature);
+    // Lagging/pooled-RPC misreport: a LANDED tx is reported provably-dead. The
+    // recovery path must NOT double-send — its outflow scan catches the landed tx.
+    if (t?.landed && !t.err && this.expiredDespiteLandedCount > 0) {
+      this.expiredDespiteLandedCount -= 1;
+      return "expired";
+    }
     if (t?.landed) return t.err ? "failed" : "confirmed";
     if (this.blockHeight > lastValidBlockHeight) return "expired";
     return "pending";
+  }
+
+  async findConfirmedOutflow(params: OutflowScanParams): Promise<OutflowMatch | null> {
+    if (this.hideOutflows) return null;
+    const known = new Set(params.knownSignatures.filter(Boolean));
+    // Authoritative, decoy-proof: return one of OUR recorded signatures that
+    // actually landed (confirmed, no error).
+    for (const sig of known) {
+      const t = this.#txs.get(sig);
+      if (t?.landed && !t.err) return { signature: sig };
+    }
+    return null;
   }
 
   // --- test observability ---

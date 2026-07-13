@@ -167,6 +167,9 @@ export function assertSourceGuards(src: string): { aoProcessId: string } {
 const sha256Hex = (s: string): string =>
   createHash("sha256").update(s, "utf8").digest("hex");
 const bytesHex = (b: Uint8Array): string => Buffer.from(b).toString("hex");
+/** base64url, no padding — the Arweave address encoding (b64url(sha256(modulus))). */
+const b64UrlNoPad = (b: Uint8Array): string =>
+  Buffer.from(b).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
 interface AoVault {
   balance: number;
@@ -204,6 +207,17 @@ export async function deriveAuthoritativeDeposits(opts: {
     if (b64) {
       const bytes = new Uint8Array(Buffer.from(b64, "base64url"));
       if (bytes.length !== 512) throw new Error(`bad modulus length for ${owner}`);
+      // AUTHORITATIVE binding (low/info hardening): an Arweave address IS
+      // base64url(sha256(modulus)). Re-derive it and require it to equal `owner`
+      // so a corrupt/decoy escrow-recipient-modulus.json entry can't bind the
+      // wrong key material to an owner — a stronger check than trusting the map.
+      const derived = b64UrlNoPad(createHash("sha256").update(bytes).digest());
+      if (derived !== owner) {
+        throw new Error(
+          `modulus for owner ${owner} does not hash to it (b64url(sha256(modulus)) = ${derived}) — ` +
+            `corrupt or spoofed escrow-recipient-modulus.json`,
+        );
+      }
       return bytes;
     }
     return null;

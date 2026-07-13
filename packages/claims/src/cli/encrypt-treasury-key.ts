@@ -9,14 +9,19 @@
 //!   TREASURY_KEY_PASSPHRASE=... tsx src/cli/encrypt-treasury-key.ts \
 //!       --out keys/treasury.sealed.json [--generate | --seed-base64 <b64>]
 //!
+//! RE-KEY an existing blob (rotate the KEK / upgrade to stronger scrypt params):
+//!   TREASURY_KEY_PASSPHRASE_OLD=<old> TREASURY_KEY_PASSPHRASE=<new> \
+//!     tsx src/cli/encrypt-treasury-key.ts --reseal keys/treasury.sealed.json \
+//!       --out keys/treasury.sealed.new.json
+//!
 //! Prints ONLY the derived public address — never the seed.
 
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { createKeyPairSignerFromPrivateKeyBytes } from "@solana/kit";
 
-import { sealSecret } from "../dispatch/crypto-box.js";
+import { reseal, sealSecret, type SealedKey } from "../dispatch/crypto-box.js";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(name);
@@ -28,6 +33,19 @@ async function main(): Promise<void> {
   if (!out) throw new Error("--out <path> is required");
   const passphrase = process.env.TREASURY_KEY_PASSPHRASE ?? process.env.ANT_SIGNER_KEY_PASSPHRASE;
   if (!passphrase) throw new Error("set TREASURY_KEY_PASSPHRASE (the runtime KEK) in the environment");
+
+  // --- RE-KEY: open an existing blob with the OLD KEK, re-seal under the NEW ---
+  const resealPath = arg("--reseal");
+  if (resealPath) {
+    const oldPass = process.env.TREASURY_KEY_PASSPHRASE_OLD ?? process.env.ANT_SIGNER_KEY_PASSPHRASE_OLD;
+    if (!oldPass) throw new Error("set TREASURY_KEY_PASSPHRASE_OLD (the current KEK) to re-key; TREASURY_KEY_PASSPHRASE is the NEW KEK");
+    const oldSealed = JSON.parse(readFileSync(resealPath, "utf8")) as SealedKey;
+    const rekeyed = reseal(oldSealed, oldPass, passphrase); // strong-KEK enforced on the new one
+    writeFileSync(out, JSON.stringify(rekeyed, null, 2) + "\n", { mode: 0o600 });
+    // eslint-disable-next-line no-console
+    console.log(JSON.stringify({ ok: true, out, resealedFrom: resealPath, n: rekeyed.n, note: "re-keyed at current scrypt params; swap in the new KEK + bounce the worker" }, null, 2));
+    return;
+  }
 
   let seed: Uint8Array;
   const seedB64 = arg("--seed-base64");

@@ -4,7 +4,10 @@
 #   docker build -f packages/claims/Dockerfile -t ar-io-claims .
 
 # --- builder ---
-FROM node:20-alpine AS builder
+# Base image DIGEST-PINNED (multi-arch OCI index) for a reproducible, tamper-
+# evident build. Re-pin deliberately on a node bump: the tag `node:20-alpine`
+# alone floats and a poisoned upstream tag would silently enter the build.
+FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS builder
 RUN corepack enable
 WORKDIR /app
 
@@ -14,7 +17,9 @@ COPY package.json yarn.lock tsconfig.base.json ./
 COPY packages/canonical/package.json ./packages/canonical/
 COPY packages/attestor/package.json ./packages/attestor/
 COPY packages/claims/package.json ./packages/claims/
-RUN yarn install --frozen-lockfile
+# --ignore-scripts: dependency install must NOT run arbitrary lifecycle scripts
+# (supply-chain hardening). Nothing in this graph needs a postinstall build.
+RUN yarn install --frozen-lockfile --ignore-scripts
 
 # Only the claims service source is needed to build it.
 COPY packages/claims ./packages/claims
@@ -24,7 +29,7 @@ RUN yarn workspace @ar.io/claims build
 RUN yarn install --frozen-lockfile --production --ignore-scripts
 
 # --- runtime ---
-FROM node:20-alpine
+FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293
 RUN addgroup -S app && adduser -S app -G app
 WORKDIR /app
 

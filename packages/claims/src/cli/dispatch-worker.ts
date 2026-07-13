@@ -13,6 +13,7 @@ import { SolanaChainGateway } from "../dispatch/chain.js";
 import { FloatManager } from "../dispatch/float.js";
 import { DispatchWorker } from "../dispatch/worker.js";
 import { assertSingleConfirmRpc, loadDispatchConfig, loadSignerRegistry } from "../dispatch/dispatch-config.js";
+import { assertVaultDurationsMatchChain, fetchArioConfigVaultDurations } from "../dispatch/ario-config.js";
 import { assertBootConfig } from "../ops/config-validation.js";
 import { collectMetrics } from "../ops/metrics.js";
 import { evaluateAlerts, loadAlertThresholds } from "../ops/alerts.js";
@@ -34,6 +35,36 @@ async function main(): Promise<void> {
   // Exactly-once confirmation reads MUST go through a single consistent endpoint.
   assertSingleConfirmRpc(dispatch.confirmRpcUrl);
   const gateway = new SolanaChainGateway(createRpc(dispatch.confirmRpcUrl));
+
+  // ITEM F — reconcile the configured vault durations against the LIVE on-chain
+  // ArioConfig and FAIL FAST on mismatch (a stale env `min` could misclassify a
+  // still-locked vault as liquid). Skippable on clusters without ario-core
+  // deployed via VAULT_DURATION_RECONCILE=off (or by leaving ARIO_CORE_PROGRAM
+  // unset — then we can't derive the ArioConfig PDA and only warn).
+  if ((process.env.VAULT_DURATION_RECONCILE ?? "on") !== "off") {
+    if (dispatch.arioCoreProgram) {
+      const { config, durations } = await fetchArioConfigVaultDurations(
+        createRpc(dispatch.confirmRpcUrl),
+        dispatch.arioCoreProgram,
+      );
+      assertVaultDurationsMatchChain(dispatch.vaultDurations, durations); // throws => boot aborts
+      // eslint-disable-next-line no-console
+      console.log(JSON.stringify({
+        msg: "vault durations reconciled with on-chain ArioConfig",
+        arioConfig: config,
+        minVaultDuration: durations.minVaultDuration.toString(),
+        maxVaultDuration: durations.maxVaultDuration.toString(),
+      }));
+    } else {
+      // eslint-disable-next-line no-console
+      console.warn(JSON.stringify({
+        msg: "WARNING: ARIO_CORE_PROGRAM unset — cannot reconcile vault durations with on-chain ArioConfig; using env values UNVERIFIED",
+        minVaultDuration: dispatch.vaultDurations.minVaultDuration.toString(),
+        maxVaultDuration: dispatch.vaultDurations.maxVaultDuration.toString(),
+      }));
+    }
+  }
+
   const signers = await loadSignerRegistry();
   const float = new FloatManager(dispatch.floatPolicy);
   const alertThresholds = loadAlertThresholds();

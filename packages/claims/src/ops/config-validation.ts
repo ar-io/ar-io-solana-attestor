@@ -110,6 +110,21 @@ export function validateBootConfig(
     err("NETWORK_RPC_MISMATCH", `NETWORK=solana-devnet but an RPC URL points at mainnet (${hostHints.trim()})`);
   }
 
+  // -- CORS origin: never a wildcard on a real network (infra hardening) ----
+  // The HTTP API echoes CORS_ORIGIN into Access-Control-Allow-Origin. `*` is fine
+  // on localnet but on a real network it must pin an explicit allowed origin.
+  if (role === "api" && network !== "localnet") {
+    const corsOrigin = env.CORS_ORIGIN;
+    if (!corsOrigin || corsOrigin === "*") {
+      const shown = corsOrigin ? '"*"' : 'unset (defaults to "*")';
+      const msg =
+        `CORS_ORIGIN is ${shown} on NETWORK=${network} — a real network MUST pin an explicit ` +
+        `allowed origin (e.g. https://claim.ar.io). "*" is only acceptable on localnet.`;
+      if (isMainnet) err("CORS_WILDCARD", msg);
+      else warn("CORS_WILDCARD", msg);
+    }
+  }
+
   // -- Single-consistent CONFIRM RPC (fatal for the worker; warn elsewhere) --
   if (confirmRpc && looksPooled(confirmRpc)) {
     const msg =

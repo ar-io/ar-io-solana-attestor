@@ -61,6 +61,33 @@ export interface SignedDispatch {
 
 export type ConfirmState = "confirmed" | "failed" | "pending" | "expired";
 
+/** A confirmed dispenser outflow discovered by the recovery-path scan. */
+export interface OutflowMatch {
+  /** The base58 signature of the CONFIRMED, matching on-chain transfer. */
+  signature: string;
+}
+
+/** Inputs for the pre-re-sign outflow scan (see `findConfirmedOutflow`). */
+export interface OutflowScanParams {
+  /**
+   * Addresses whose recent on-chain history to scan. Every dispatch tx references
+   * both the hot dispenser (fee payer) and the claimant (ATA owner / new NFT
+   * owner), so either surfaces the tx via `getSignaturesForAddress`.
+   */
+  addresses: Address[];
+  /**
+   * This claim's OWN recorded signatures (dispatch_signature + tx_signatures).
+   * The match is AUTHORITATIVE by signature: an attacker cannot forge a tx under
+   * our signature, so a decoy tx that merely references our address or carries our
+   * memo can NEVER be mistaken for a real dispense (no false `confirmed`).
+   */
+  knownSignatures: string[];
+  /** `ar.io-claim:<id>` — the on-chain marker our dispatch carries (audit only). */
+  memo?: string;
+  /** How far back to scan per address (default 1000). */
+  limit?: number;
+}
+
 export interface ChainGateway {
   /** SPL token balance of `ata` in mARIO; 0n if the account does not exist. */
   getTokenBalance(ata: Address): Promise<bigint>;
@@ -87,6 +114,17 @@ export interface ChainGateway {
    * vs `pending` (still landable => re-broadcast the same bytes).
    */
   confirmSignature(signature: string, lastValidBlockHeight: bigint): Promise<ConfirmState>;
+  /**
+   * DEFENSE-IN-DEPTH against a lagging/pooled confirm-RPC (adversarial-pass item
+   * A): before the recovery path re-signs a claim whose prior tx was classified
+   * `expired`, scan the dispenser/claimant on-chain history for a CONFIRMED tx
+   * that is one of THIS claim's own recorded signatures. If found, the transfer
+   * already landed (the `getSignatureStatuses` read simply lagged) and the worker
+   * marks the claim confirmed instead of emitting a second on-chain send. Matching
+   * is by our own signature (decoy-proof); `null` = no landed outflow found, so a
+   * single bounded re-sign is safe.
+   */
+  findConfirmedOutflow(params: OutflowScanParams): Promise<OutflowMatch | null>;
 }
 
 type KitRpc = Rpc<SolanaRpcApi>;
@@ -209,6 +247,32 @@ export class SolanaChainGateway implements ChainGateway {
       if (Date.now() >= deadline) return "pending";
       await sleep(this.#confirmPollMs);
     }
+  }
+
+  async findConfirmedOutflow(params: OutflowScanParams): Promise<OutflowMatch | null> {
+    const known = new Set(params.knownSignatures.filter(Boolean));
+    if (known.size === 0) return null; // nothing of ours to match against
+    const limit = params.limit ?? 1000;
+    for (const addr of params.addresses) {
+      let page: Awaited<ReturnType<ReturnType<KitRpc["getSignaturesForAddress"]>["send"]>>;
+      try {
+        page = await this.#rpc.getSignaturesForAddress(addr, { limit }).send();
+      } catch {
+        continue; // a single address failing must not block the scan
+      }
+      for (const e of page) {
+        // Only a CONFIRMED (or finalized), non-erroring tx counts as a landed
+        // transfer. `err != null` means it reverted; ignore it.
+        if (e.err != null) continue;
+        const cs = e.confirmationStatus;
+        if (cs !== "confirmed" && cs !== "finalized") continue;
+        // AUTHORITATIVE match: the tx is one WE signed for this claim. A decoy
+        // that merely references our address or replays our memo cannot appear
+        // here under our signature, so this can never yield a false confirm.
+        if (known.has(e.signature)) return { signature: e.signature };
+      }
+    }
+    return null;
   }
 }
 

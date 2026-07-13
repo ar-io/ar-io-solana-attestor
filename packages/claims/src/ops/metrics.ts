@@ -102,6 +102,10 @@ const CLAIM_STATUSES = [
   "confirmed",
   "rejected",
   "failed",
+  // Terminal-until-operator states (adversarial-pass items A + V) — surfaced so a
+  // gauge reads 0 (not absent) and the alert rules can fire off them.
+  "needs_operator",
+  "awaiting_manual_vault_delivery",
 ] as const;
 
 /** Collect every DB-derived metric (no chain access needed). */

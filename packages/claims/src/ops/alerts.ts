@@ -96,6 +96,31 @@ export function evaluateAlerts(s: MetricsSnapshot, t: AlertThresholds = DEFAULT_
     });
   }
 
+  // --- dispatch-needs-operator (CRITICAL) — a claim hit the re-sign cap. ---
+  // Adversarial item A: a claim frozen `needs_operator` after repeated `expired`
+  // classifications with no landed outflow (possible lagging/pooled confirm-RPC).
+  // NEVER auto-retried; an operator must verify on-chain before any re-drive.
+  const needsOperator = s.claims.byStatus.needs_operator ?? 0;
+  if (needsOperator > 0) {
+    alerts.push({
+      name: "dispatch-needs-operator",
+      severity: "critical",
+      message: `${needsOperator} claim(s) are frozen 'needs_operator' after exceeding the dispatch re-sign cap — a possible lagging/pooled confirm-RPC. The worker will NOT auto-retry. Verify the dispenser's on-chain outflows before any manual re-drive.`,
+      value: needsOperator,
+    });
+  }
+
+  // --- vault-manual-delivery-queue (WARNING) — item V operator hand-offs. ---
+  const manualVault = s.claims.byStatus.awaiting_manual_vault_delivery ?? 0;
+  if (manualVault > 0) {
+    alerts.push({
+      name: "vault-manual-delivery-queue",
+      severity: "warning",
+      message: `${manualVault} still-locked vault claim(s) await MANUAL delivery — run 'yarn vault:manual-queue' and hand-deliver each with its correct absolute unlock date (or deliver liquid if already unlocked).`,
+      value: manualVault,
+    });
+  }
+
   // --- dispatch-failure (CRITICAL when at/over the count) — needs an operator. ---
   if (s.dispatch.failed >= t.dispatchFailureCritical) {
     alerts.push({

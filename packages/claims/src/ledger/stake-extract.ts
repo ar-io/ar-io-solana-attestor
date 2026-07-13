@@ -7,6 +7,14 @@
 //! time and falls back to a liquid escrow below the 14-day minimum. Operator
 //! exit-vaults carry their source so a still-locked exit is extended (not
 //! liquid-expedited).
+//!
+//! CROSS-REPO "normalize first" CONTRACT: EVERY address-bearing seed namespace
+//! (`stake-escrow:`, `stake-escrow-liquid:`, `withdrawal-escrow:`,
+//! `withdrawal-escrow-liquid:`) wraps its address in `normalizeSourceAddress`
+//! (lowercase ETH) so an ETH owner's asset_id is case-STABLE — a claimant signing
+//! with a checksummed address and a snapshot carrying lowercase must land on the
+//! SAME escrow PDA. This copy MUST stay byte-identical to the authoritative
+//! solana-ar-io original; the M1 reconciler imports that original and diffs.
 
 import { normalizeSourceAddress } from "./normalize.js";
 
@@ -91,7 +99,7 @@ export function collectStakeWithdrawalEscrow(artifact: PlanArtifact): EscrowDepo
     })),
     ...withdrawalPlan.escrowVaults.map((v) => ({
       arweaveAddr: v.arweaveAddr,
-      assetIdSeed: `withdrawal-escrow:${v.arweaveAddr}:${v.vaultKey}`,
+      assetIdSeed: `withdrawal-escrow:${normalizeSourceAddress(v.arweaveAddr)}:${v.vaultKey}`,
       amountMario: BigInt(v.amountMario),
       unlockTs: v.unlockTs,
       kind: `withdrawal:${v.source ?? "unknown"}:${v.vaultKey}`,
@@ -101,19 +109,19 @@ export function collectStakeWithdrawalEscrow(artifact: PlanArtifact): EscrowDepo
   const liquid: EscrowLiquidDeposit[] = [
     ...stakePlan.operatorLiquidEscrows.map((v) => ({
       arweaveAddr: v.arweaveAddr,
-      assetIdSeed: `stake-escrow-liquid:${v.arweaveAddr}:${v.kind}`,
+      assetIdSeed: `stake-escrow-liquid:${normalizeSourceAddress(v.arweaveAddr)}:${v.kind}`,
       amountMario: BigInt(v.amountMario),
       kind: v.kind,
     })),
     ...stakePlan.delegatorLiquidEscrows.map((v) => ({
       arweaveAddr: v.arweaveAddr,
-      assetIdSeed: `stake-escrow-liquid:${v.arweaveAddr}:${v.kind}`,
+      assetIdSeed: `stake-escrow-liquid:${normalizeSourceAddress(v.arweaveAddr)}:${v.kind}`,
       amountMario: BigInt(v.amountMario),
       kind: v.kind,
     })),
     ...withdrawalPlan.liquidEscrows.map((v) => ({
       arweaveAddr: v.arweaveAddr,
-      assetIdSeed: `withdrawal-escrow-liquid:${v.arweaveAddr}:${v.vaultKey}`,
+      assetIdSeed: `withdrawal-escrow-liquid:${normalizeSourceAddress(v.arweaveAddr)}:${v.vaultKey}`,
       amountMario: BigInt(v.amountMario),
       kind: `withdrawal:${v.source ?? "unknown"}:${v.vaultKey}`,
     })),
@@ -130,15 +138,35 @@ export function totalEscrowMario(set: EscrowDepositSet): bigint {
   return sum;
 }
 
-/** Assert every assetIdSeed is unique — a collision would alias escrow PDAs. */
+/**
+ * Assert every assetIdSeed is unique — a collision would alias escrow PDAs.
+ *
+ * Checks BOTH exact and case-INSENSITIVE uniqueness. All address-bearing seeds
+ * are normalized (`normalizeSourceAddress` -> lowercase ETH), so two entries that
+ * differ only in an ETH address's case now collapse to the same exact seed and
+ * the exact check catches them. The case-insensitive check is the belt-and-
+ * suspenders guard that would have caught the ORIGINAL casing bug (a raw
+ * `withdrawal-escrow:0xABC…` vs `withdrawal-escrow:0xabc…`) even before the
+ * normalization fix — a residual case-variant collision is a red flag.
+ */
 export function assertUniqueAssetSeeds(set: EscrowDepositSet): void {
   const seen = new Set<string>();
+  const seenLower = new Map<string, string>();
   for (const e of [...set.vaults, ...set.liquid]) {
     if (seen.has(e.assetIdSeed)) {
       throw new Error(
         `stake-extract: duplicate assetIdSeed "${e.assetIdSeed}" — escrow PDAs would alias`,
       );
     }
+    const lower = e.assetIdSeed.toLowerCase();
+    const prior = seenLower.get(lower);
+    if (prior !== undefined && prior !== e.assetIdSeed) {
+      throw new Error(
+        `stake-extract: case-variant assetIdSeed collision "${prior}" vs "${e.assetIdSeed}" — ` +
+          `these differ only by case (likely an un-normalized ETH address) and would alias escrow PDAs`,
+      );
+    }
     seen.add(e.assetIdSeed);
+    seenLower.set(lower, e.assetIdSeed);
   }
 }

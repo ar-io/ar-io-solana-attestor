@@ -54,7 +54,7 @@ import { address, type Address, type IInstruction, type TransactionSigner } from
 
 import type { Config } from "../config.js";
 import { appendAudit } from "../api/audit.js";
-import { computeVaultSettlement } from "../verify/vault-settlement.js";
+import { computeVaultSettlement, type VaultSettlement } from "../verify/vault-settlement.js";
 import type { ChainGateway, SignedDispatch } from "./chain.js";
 import { FloatManager } from "./float.js";
 import { assertSeparableRoles, type DispenserSigner, type SignerRegistry } from "./signer.js";
@@ -80,7 +80,9 @@ export interface DispatchWorkerDeps {
   config: Config;
   /** ARIO SPL mint. */
   mint: Address;
-  /** Live ario-core ArioConfig.min/max_vault_duration (operator reads them live). */
+  /** ario-core ArioConfig.min/max_vault_duration — configured via env and
+   *  boot-reconciled against the live on-chain ArioConfig (mismatch aborts the
+   *  worker; see dispatch/ario-config.ts). */
   vaultDurations: VaultDurations;
   /** ario-core program id — required to build a vault RE-LOCK; absent => relock routes to review. */
   arioCoreProgram?: Address;
@@ -94,7 +96,17 @@ export interface DispatchWorkerDeps {
   now?: () => bigint;
   /** Structured log sink. */
   log?: (msg: string, extra?: Record<string, unknown>) => void;
+  /** Optional critical-alert sink. Fired when a claim is frozen `needs_operator`
+   *  after exceeding the re-sign cap (a possible RPC anomaly). Best-effort — the
+   *  durable operator-facing alert is the metrics `dispatch-needs-operator`. */
+  alert?: (a: { name: string; severity: "critical" | "warning"; message: string; claimId: string }) => void;
 }
+
+/** HARD CAP on dispatch re-signs per claim (adversarial item A). After the first
+ *  provably-dead re-sign, a further expiry freezes the claim `needs_operator`
+ *  rather than emitting another on-chain send — bounds the blast radius under a
+ *  persistently lagging/pooled confirm-RPC to at most one extra transfer. */
+const MAX_RESIGN_ATTEMPTS = 1;
 
 export type DispatchOutcome =
   | "confirmed"
@@ -106,6 +118,12 @@ export type DispatchOutcome =
   | "routed_to_review"
   | "awaiting_approval"
   | "awaiting_ant_signer"
+  // Terminal-until-operator: the re-sign cap was hit (possible RPC anomaly); the
+  // claim is frozen for an operator instead of emitting another on-chain send (A).
+  | "needs_operator"
+  // A still-locked vault claim: routed to the manual-delivery operator queue with
+  // the correct absolute unlock timestamp instead of an auto CPI / a review loop (V).
+  | "awaiting_manual_vault_delivery"
   | "skipped";
 
 export interface DispatchResult {
@@ -128,6 +146,7 @@ interface ClaimRow {
   dispatch_last_valid_bh: string | null;
   settlement_amount: string | null;
   tx_signatures: string[] | null;
+  dispatch_resign_count: number;
 }
 interface AssetRow {
   asset_key: string;
@@ -258,9 +277,40 @@ export class DispatchWorker {
       return { claimId: snap.claim_id, assetKey: snap.asset_key, outcome: "failed", signature: sig, detail: "tx failed" };
     }
     if (state === "expired") {
-      // The persisted tx is permanently dead. Clear the dead sig and re-dispatch.
+      // ADVERSARIAL ITEM A — a lagging/pooled confirm-RPC can misreport a LANDED
+      // tx as not-found -> `expired`. Re-signing on that false premise DOUBLE-
+      // SENDS. Before re-signing, independently scan the dispenser + claimant
+      // on-chain history for a CONFIRMED tx that is one of THIS claim's own
+      // recorded signatures. If found, the transfer already landed and we finalize
+      // (never re-sign). Matching by our own signature is decoy-proof.
+      const known = [sig, ...(snap.tx_signatures ?? [])].filter(Boolean) as string[];
+      const outflow = await this.#d.gateway.findConfirmedOutflow({
+        addresses: [this.#d.signers.token.address, address(snap.claimant)],
+        knownSignatures: known,
+        memo: `ar.io-claim:${snap.claim_id}`,
+      });
+      if (outflow) {
+        this.#log("recover: outflow scan found a landed tx despite an `expired` status — confirming, NOT re-sending", {
+          claimId: snap.claim_id, deadSig: sig, landedSig: outflow.signature,
+        });
+        await this.#finalizeConfirmed(snap.claim_id, outflow.signature);
+        return { claimId: snap.claim_id, assetKey: snap.asset_key, outcome: "recovered_confirmed", signature: outflow.signature };
+      }
+
+      // No landed outflow: the prior tx is provably dead AND never landed. Re-sign
+      // ONCE. Beyond the cap, freeze the claim `needs_operator` (never loop) so a
+      // persistently misbehaving RPC can't drive N sends. + a critical alert.
+      if ((snap.dispatch_resign_count ?? 0) >= MAX_RESIGN_ATTEMPTS) {
+        await this.#markNeedsOperator(
+          snap.claim_id,
+          `dispatch re-sign cap (${MAX_RESIGN_ATTEMPTS}) exceeded after repeated \`expired\` classifications with no landed outflow — possible lagging/pooled confirm-RPC. Frozen for an operator; do NOT auto-retry. Verify on-chain before any manual re-drive.`,
+        );
+        return { claimId: snap.claim_id, assetKey: snap.asset_key, outcome: "needs_operator", signature: sig, detail: "resign cap exceeded" };
+      }
+      // The persisted tx is permanently dead. Clear the dead sig (bumps the
+      // resign counter) and re-dispatch a single fresh tx.
       await this.#clearDeadSignature(snap.claim_id);
-      this.#log("recover: prior tx expired, re-dispatching", { claimId: snap.claim_id, deadSig: sig });
+      this.#log("recover: prior tx expired (no landed outflow), re-dispatching once", { claimId: snap.claim_id, deadSig: sig });
       return this.#dispatchFresh(snap.claim_id, antSignerOverride);
     }
     // pending + still valid: a prior broadcast may yet land; do not touch it.
@@ -341,22 +391,35 @@ export class DispatchWorker {
     let settlementLabel: string;
 
     if (asset.asset_type === "vault") {
-      const settlement = computeVaultSettlement({
-        vaultEndTs: BigInt(asset.vault_end_ts ?? "0"),
-        amount,
-        minVaultDuration: this.#d.vaultDurations.minVaultDuration,
-        maxVaultDuration: this.#d.vaultDurations.maxVaultDuration,
-        now: this.#now(),
-      });
+      const vaultEndTs = BigInt(asset.vault_end_ts ?? "0");
+      let settlement: VaultSettlement;
+      try {
+        settlement = computeVaultSettlement({
+          vaultEndTs,
+          amount,
+          minVaultDuration: this.#d.vaultDurations.minVaultDuration,
+          maxVaultDuration: this.#d.vaultDurations.maxVaultDuration,
+          now: this.#now(),
+        });
+      } catch (e) {
+        // Only LOCK_DURATION_TOO_LONG is a settlement anomaly (remaining >
+        // max_vault_duration); route it to the operator with the absolute unlock
+        // rather than silently capping or crashing the tick.
+        const remaining = vaultEndTs - this.#now();
+        await this.#routeToManualVaultDelivery(claimId, asset.asset_key, vaultEndTs, remaining > 0n ? remaining : 0n);
+        return { claimId, assetKey: asset.asset_key, outcome: "awaiting_manual_vault_delivery", detail: `vault settlement anomaly: ${(e as Error).message}` };
+      }
       if (settlement.kind === "relock") {
-        // RE-LOCK needs the deployed ario-core + a provisioned vault ATA (residual;
-        // see instructions.ts). Not built inline here — route to the operator so a
-        // relock is never silently downgraded to liquid (never "silently cap").
-        await this.#routeToReview(
-          claimId, asset.asset_key,
-          `vault re-lock (${settlement.lockDurationSeconds}s) requires operator/ario-core relock path`,
+        // ADVERSARIAL ITEM V — a still-locked vault claim is NOT auto-relocked via
+        // a CPI and must NOT loop in `pending_review`. Route it to the MANUAL
+        // operator delivery queue with the CORRECT ABSOLUTE unlock timestamp (==
+        // the escrow's original vault_end_timestamp). The operator hand-delivers a
+        // "transfer tokens locked" to that end date; if it has since passed by the
+        // time the operator acts, the queue report flags deliver-UNLOCKED (liquid).
+        await this.#routeToManualVaultDelivery(
+          claimId, asset.asset_key, settlement.unlockTimestamp, settlement.lockDurationSeconds,
         );
-        return { claimId, assetKey: asset.asset_key, outcome: "routed_to_review", detail: "vault relock" };
+        return { claimId, assetKey: asset.asset_key, outcome: "awaiting_manual_vault_delivery", detail: "vault relock -> manual delivery" };
       }
       settlementLabel = `liquid:${settlement.reason}`;
       ixs = await this.#buildTokenIxs(claimId, hotSigner, claimant, amount);
@@ -569,6 +632,73 @@ export class DispatchWorker {
     }
   }
 
+  /**
+   * Freeze a claim `needs_operator` (terminal-until-operator). Used when the
+   * re-sign cap is exceeded (adversarial item A): the claim is NEVER auto-retried
+   * — an operator must verify on-chain and re-drive. Asset stays `claiming` (not
+   * released), so no other claim can win it. Fires a critical alert.
+   */
+  async #markNeedsOperator(claimId: string, reason: string): Promise<void> {
+    const client = await this.#d.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const c = await this.#loadClaim(client, claimId, true);
+      if (!c || c.status === "confirmed" || c.status === "needs_operator") {
+        await client.query("ROLLBACK");
+        return;
+      }
+      await client.query("UPDATE claims SET status = 'needs_operator', error = $2, updated_at = now() WHERE claim_id = $1", [claimId, reason]);
+      await appendAudit(client, { event: "claim.needs_operator", claimId, assetKey: c.asset_key, status: "needs_operator", reason, detail: { severity: "critical", deadSignature: c.dispatch_signature ?? undefined } });
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+    this.#log("CRITICAL: claim frozen needs_operator", { claimId, reason });
+    this.#d.alert?.({ name: "dispatch-needs-operator", severity: "critical", message: reason, claimId });
+  }
+
+  /**
+   * Route a still-locked vault claim to the MANUAL-delivery operator queue (V):
+   * the operator hand-delivers a "transfer tokens locked" to the correct absolute
+   * unlock timestamp (== the escrow's original vault_end_timestamp), NOT an auto
+   * CPI and NOT an infinite `pending_review` loop. The precise per-vault delivery
+   * instructions (claimant, amount, absolute unlock, or deliver-liquid if already
+   * unlocked) are produced by `vaultManualDeliveryQueue` from the asset's
+   * `vault_end_ts`. Asset stays `pending_review` so no other claim can win it.
+   */
+  async #routeToManualVaultDelivery(claimId: string, assetKey: string, unlockTs: bigint, lockDurationSeconds: bigint): Promise<void> {
+    const client = await this.#d.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const c = await this.#loadClaim(client, claimId, true);
+      if (!c || c.status === "confirmed" || c.status === "dispatching") {
+        await client.query("ROLLBACK");
+        return;
+      }
+      await client.query(
+        "UPDATE claims SET status = 'awaiting_manual_vault_delivery', settlement = 'manual_vault_relock', updated_at = now() WHERE claim_id = $1",
+        [claimId],
+      );
+      await client.query(
+        "UPDATE assets SET status = 'pending_review', updated_at = now() WHERE asset_key = $1 AND status NOT IN ('claimed')",
+        [assetKey],
+      );
+      await appendAudit(client, {
+        event: "claim.awaiting_manual_vault_delivery", claimId, assetKey, status: "awaiting_manual_vault_delivery",
+        detail: { unlockTimestamp: unlockTs.toString(), lockDurationSeconds: lockDurationSeconds.toString() },
+      });
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
   /** Clear a provably-dead (expired) signature so a fresh dispatch can re-sign. */
   async #clearDeadSignature(claimId: string): Promise<void> {
     const client = await this.#d.pool.connect();
@@ -581,10 +711,12 @@ export class DispatchWorker {
       }
       // Revert to `verified` (or pending_review if it was operator-approved) so
       // #dispatchFresh re-signs. The dead sig stays in tx_signatures history.
+      // Bump dispatch_resign_count so the recovery path enforces the hard cap (A).
       const revertTo = c.approved_at ? "pending_review" : "verified";
       await client.query(
         `UPDATE claims SET status = $2, dispatch_signature = NULL, dispatch_blockhash = NULL,
-             dispatch_last_valid_bh = NULL, updated_at = now() WHERE claim_id = $1`,
+             dispatch_last_valid_bh = NULL, dispatch_resign_count = dispatch_resign_count + 1,
+             updated_at = now() WHERE claim_id = $1`,
         [claimId, revertTo],
       );
       await appendAudit(client, {
@@ -632,7 +764,8 @@ export class DispatchWorker {
     const r = await db.query<ClaimRow>(
       `SELECT claim_id, asset_key, claimant, status, settlement, approved_at,
               dispatch_signature, dispatch_blockhash, dispatch_last_valid_bh::text AS dispatch_last_valid_bh,
-              settlement_amount::text AS settlement_amount, tx_signatures
+              settlement_amount::text AS settlement_amount, tx_signatures,
+              dispatch_resign_count
          FROM claims WHERE claim_id = $1${forUpdate ? " FOR UPDATE" : ""}`,
       [claimId],
     );

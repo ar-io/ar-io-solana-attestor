@@ -52,6 +52,7 @@ describe("FloatManager.status", () => {
       signTransaction: async () => { throw new Error("unused"); },
       broadcast: async () => {},
       confirmSignature: async () => "pending",
+      findConfirmedOutflow: async () => null,
     };
   }
   function stubDb(reserved: bigint) {

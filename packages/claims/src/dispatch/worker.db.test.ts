@@ -293,15 +293,18 @@ describe("dispatch worker — exactly-once + custody (DB)", { skip: !HAS_DB }, (
     assert.equal(cs.settlement, (5000n * ONE_TOKEN).toString());
   });
 
-  it("vault-relock (still locked, long remaining) routes to operator (never silently liquid)", async () => {
+  it("vault-relock (still locked, long remaining) routes to MANUAL delivery (never silently liquid, never loops) [item V]", async () => {
     const future = Math.floor(Date.now() / 1000) + 200 * 86_400; // 200 days out
     const seed = await seedVerifiedClaim({ assetType: "vault", amount: 5000n * ONE_TOKEN, vaultEndTs: future });
     track(seed);
     const fake = new FakeChainGateway();
     const worker = await makeWorker(fake);
     const res = await worker.processClaim(seed.claimId);
-    assert.equal(res.outcome, "routed_to_review");
+    // Item V: a still-locked vault is NOT auto-relocked and NOT looped in review —
+    // it goes to the manual-delivery operator queue with its absolute unlock ts.
+    assert.equal(res.outcome, "awaiting_manual_vault_delivery");
     assert.equal(fake.signCount, 0);
+    assert.equal((await claimStatus(seed.claimId)).status, "awaiting_manual_vault_delivery");
     assert.equal(await assetStatus(seed.assetKey), "pending_review");
   });
 

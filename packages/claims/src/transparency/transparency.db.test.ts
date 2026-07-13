@@ -50,6 +50,9 @@ class MapGateway implements ChainGateway {
   async confirmSignature(): Promise<"confirmed"> {
     return "confirmed";
   }
+  async findConfirmedOutflow(): Promise<null> {
+    return null;
+  }
 }
 
 describe("M6 transparency (DB)", { skip: !HAS_DB }, () => {

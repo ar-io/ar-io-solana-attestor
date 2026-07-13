@@ -15,7 +15,7 @@ import {
 
 describe("EncryptedKeypairSigner", () => {
   const seed = new Uint8Array(randomBytes(32));
-  const pass = "unlock me please";
+  const pass = "unlock-me-please-9f3a7c2e1b8d40"; // high-entropy KEK (>=24 chars)
 
   it("loads from a sealed blob and yields a stable kit signer", async () => {
     const sealed = sealSecret(seed, pass);

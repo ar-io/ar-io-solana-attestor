@@ -1,8 +1,12 @@
 //! Vault claim settlement decision (ADR-027) — pure, recomputed at claim time.
 //!
 //! Consumed by M4 dispatch. Given the escrow's ORIGINAL `vault_end_timestamp`
-//! + amount and the LIVE `ArioConfig.min_vault_duration` / `max_vault_duration`
-//! (read from ario-core at dispatch), decide how to settle the claim. This is
+//! + amount and the `ArioConfig.min_vault_duration` / `max_vault_duration`, decide
+//! how to settle the claim. Those durations are supplied from the worker config
+//! (`VAULT_MIN/MAX_DURATION_SECONDS`) and are RECONCILED against the live on-chain
+//! `ArioConfig` at worker boot — a mismatch FAILS the boot (see
+//! `dispatch/ario-config.ts`), so the values passed here are guaranteed to equal
+//! the on-chain truth even though they are not re-read per dispatch. This is
 //! the authoritative settlement decision — the ledger's `asset_type` is
 //! ADVISORY; a deposit that was `deposit_vault` at freeze may have crossed its
 //! unlock (or its early-liquidity window) by claim time.
@@ -57,9 +61,10 @@ function toBig(v: bigint | number): bigint {
 }
 
 /**
- * Compute the ADR-027 settlement for a vault claim. Pure — no I/O. `now`,
- * `minVaultDuration`, `maxVaultDuration` are LIVE values (M4 reads them from
- * ario-core `ArioConfig` at dispatch time and passes them in).
+ * Compute the ADR-027 settlement for a vault claim. Pure — no I/O. `now` is the
+ * live clock; `minVaultDuration` / `maxVaultDuration` come from the worker config
+ * and are boot-reconciled against the on-chain `ArioConfig` (a mismatch aborts the
+ * worker), so they are guaranteed equal to the on-chain values.
  */
 export function computeVaultSettlement(args: {
   /** Original absolute unlock, unix seconds. */

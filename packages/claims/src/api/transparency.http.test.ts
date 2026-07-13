@@ -95,6 +95,15 @@ describe("transparency HTTP routes", { skip: HAS_DB ? false : "DATABASE_URL not 
     assert.equal(anch.statusCode, 200);
     assert.ok(Array.isArray(anch.json().anchors));
 
+    // A non-numeric ?limit must NOT reach SQL as `LIMIT NaN` (would 500). It is
+    // clamped to the default instead — 200, not 500 (low/info hardening).
+    const badLog = await app.inject({ method: "GET", url: "/v1/transparency/log?limit=abc" });
+    assert.equal(badLog.statusCode, 200, "bad ?limit must clamp, not 500");
+    assert.ok(Array.isArray(badLog.json().entries));
+    const badAnch = await app.inject({ method: "GET", url: "/v1/transparency/anchors?limit=NaN" });
+    assert.equal(badAnch.statusCode, 200, "bad ?limit must clamp, not 500");
+    assert.ok(Array.isArray(badAnch.json().anchors));
+
     // reserves route is registered (503 when mint/treasury not configured in env)
     const res = await app.inject({ method: "GET", url: "/v1/transparency/reserves" });
     assert.notEqual(res.statusCode, 404);

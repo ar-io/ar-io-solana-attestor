@@ -20,6 +20,7 @@ function goodWorkerEnv(): NodeJS.ProcessEnv {
     DATABASE_URL: "postgres://u:p@db:5432/claims",
     SOLANA_RPC_URL: "https://api.mainnet-beta.solana.com",
     CONFIRM_RPC_URL: "https://my-single-rpc.example.com",
+    CORS_ORIGIN: "https://claim.ar.io",
     ARIO_MINT: ADDR_A,
     TREASURY_KEY_SEALED_PATH: "/run/secrets/treasury.json",
     TREASURY_KEY_PASSPHRASE: "kek",
@@ -65,6 +66,28 @@ describe("validateBootConfig — documented misconfigs fail fast", () => {
     const api = validateBootConfig(env, { role: "api" });
     assert.equal(api.ok, true);
     assert.ok(api.warnings.some((w) => w.code === "CONFIRM_RPC_POOLED"));
+  });
+
+  it("CORS: wildcard/unset origin is an API ERROR on mainnet, a WARNING on devnet, fine on localnet", () => {
+    // mainnet + "*" -> API error.
+    const wildMain = { ...goodWorkerEnv(), CORS_ORIGIN: "*" };
+    const rMain = validateBootConfig(wildMain, { role: "api" });
+    assert.equal(rMain.ok, false);
+    assert.ok(rMain.errors.some((e) => e.code === "CORS_WILDCARD"), JSON.stringify(rMain.errors));
+    // mainnet + unset -> API error too (defaults to "*").
+    const unsetMain = { ...goodWorkerEnv() };
+    delete unsetMain.CORS_ORIGIN;
+    assert.ok(validateBootConfig(unsetMain, { role: "api" }).errors.some((e) => e.code === "CORS_WILDCARD"));
+    // devnet + "*" -> WARNING (real network, not prod-critical).
+    const wildDev = { ...goodWorkerEnv(), NETWORK: "solana-devnet", SOLANA_RPC_URL: "https://api.devnet.solana.com", CONFIRM_RPC_URL: "https://api.devnet.solana.com", CORS_ORIGIN: "*" };
+    const rDev = validateBootConfig(wildDev, { role: "api" });
+    assert.ok(rDev.warnings.some((w) => w.code === "CORS_WILDCARD"));
+    assert.ok(!rDev.errors.some((e) => e.code === "CORS_WILDCARD"));
+    // localnet + "*" -> no CORS finding at all.
+    const localWild = { ...goodWorkerEnv(), NETWORK: "localnet", SOLANA_RPC_URL: "http://127.0.0.1:8899", CONFIRM_RPC_URL: "http://127.0.0.1:8899", CORS_ORIGIN: "*" };
+    const rLocal = validateBootConfig(localWild, { role: "api" });
+    assert.ok(!rLocal.errors.some((e) => e.code === "CORS_WILDCARD"));
+    assert.ok(!rLocal.warnings.some((w) => w.code === "CORS_WILDCARD"));
   });
 
   it("MISCONFIG 2: two of the five keys sharing an address is a KEY_REUSE error", () => {

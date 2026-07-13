@@ -129,6 +129,14 @@ now the *exclusive* candidate when set, no silent sibling fallback).
    (a `SELECT 1;` up/down with the schema deferred to M1). Verified:
    `migrate:up` and `migrate:down` both apply against a real Postgres 16.
 
+   **Destructive down-migrations are gated (adversarial-pass item E).**
+   `migrate:down` runs through `scripts/migrate-down-guard.mjs`, which REFUSES
+   unless `ALLOW_DESTRUCTIVE_DOWN=1` **and** `NETWORK != solana-mainnet` (never on
+   mainnet, even with the flag). The migrations' Down bodies remain for local/dev
+   rollback; the runner is the guard. In production the app DB role SHOULD NOT
+   hold `DROP` (defense in depth), and the `ledger` / `audit_log` tables are
+   APPEND-ONLY — a down-migration must never be the mechanism that mutates them.
+
 4. **HTTP framework for claims: Fastify.** The task allowed Fastify or
    Express. Fastify was chosen for the new service because (a) it has
    first-class pino logging (the attestor already standardizes on pino);
@@ -686,8 +694,16 @@ the same Postgres the ledger is built into).
 
 For vault assets, `completeClaim` records a coarse `settlement` (`liquid|relock`)
 via the deposit-time `vaultEscrowFallsBackToLiquid` + an expiry check. **M4
-recomputes it live** from `ArioConfig.min/max_vault_duration` at dispatch (the
-authoritative decision); M3's value is advisory for the audit trail.
+recomputes it at dispatch** (the authoritative decision) from
+`ArioConfig.min/max_vault_duration`; M3's value is advisory for the audit trail.
+Those durations come from the worker config (`VAULT_MIN/MAX_DURATION_SECONDS`)
+and are **reconciled against the live on-chain `ArioConfig` at worker boot** — a
+mismatch FAILS the boot (`dispatch/ario-config.ts`), so they are guaranteed to
+equal the on-chain values even though they are not re-read per dispatch. A
+still-locked (`relock`) settlement is NOT auto-relocked via a CPI: it routes to
+the **manual-delivery operator queue** (`awaiting_manual_vault_delivery`, see
+`yarn vault:manual-queue`) carrying the correct absolute unlock timestamp; if the
+unlock has since passed it is delivered liquid instead.
 
 ### Money & reuse
 
@@ -827,6 +843,18 @@ exploits both, WITHOUT durable nonces:
    ever signed once the previous one is provably dead ⇒ **at most one signature
    per claim ever lands.**
 
+   **Lagging/pooled-RPC hardening (minimal, no durable nonces).** A lagging or
+   pooled confirm-RPC can misreport a *landed* tx as `expired`, which would
+   double-send. So on `expired`, **before re-signing**, the worker scans the
+   dispenser's + claimant's on-chain outflows (`getSignaturesForAddress`) for a
+   CONFIRMED tx that is one of THIS claim's own recorded signatures; if found it
+   finalizes `confirmed` and never re-sends (match is by our own signature —
+   decoy-proof). If no landed outflow exists, it re-signs, but a **HARD CAP of one
+   re-sign per claim** (`dispatch_resign_count`) bounds the blast radius: a second
+   `expired` with no outflow freezes the claim `needs_operator` (never loops) and
+   fires a CRITICAL alert (`dispatch-needs-operator`). Operator keeps a single
+   consistent `CONFIRM_RPC_URL`; this is defense-in-depth, not a substitute.
+
 Asset lifecycle `available → claiming → claimed`; a confirmed dispense marks the
 asset `claimed` (terminal) + the `one_live_claim_per_asset` unique index is the
 belt-and-suspenders backstop, so no second claim can win and no second dispatch
@@ -838,13 +866,19 @@ un-confirmed broadcast).
 - **Token**: idempotent `createIdempotent` ATA + plain SPL `Transfer` of the
   exact mARIO from the hot dispenser to the claimant ATA (`instructions.ts`,
   byte-parity unit-tested vs the mainnet-proven `claim-transfers.ts`).
-- **Vault**: recomputed LIVE at dispatch via M2 `computeVaultSettlement` against
-  `ArioConfig.min/max_vault_duration` (the operator sources these live; passed as
-  `vaultDurations`). `liquid` (expired / sub-min / early-window) → SPL transfer;
-  `relock` → treasury-signed `vaulted_transfer` (`vaultedTransferIx`, discriminator
-  + args + PDAs unit-tested). **Never silently caps an over-max lock** — an
-  over-`max_vault_duration` remaining throws; a relock is routed to the operator
-  rather than silently downgraded to liquid.
+- **Vault**: recomputed at dispatch via M2 `computeVaultSettlement` against
+  `ArioConfig.min/max_vault_duration` (passed as `vaultDurations` from the worker
+  config, and **boot-reconciled against the live on-chain `ArioConfig`** — a
+  mismatch aborts the worker, so they equal on-chain even though not re-read per
+  dispatch). `liquid` (expired / sub-min / early-window) → SPL transfer. `relock`
+  (still-locked) → routed to the **manual-delivery operator queue**
+  (`awaiting_manual_vault_delivery`), NOT an auto CPI and NOT a `pending_review`
+  loop: the operator hand-delivers a "transfer tokens locked" to the correct
+  ABSOLUTE unlock (== the escrow's original `vault_end_timestamp`) via
+  `yarn vault:manual-queue`; if that unlock has since passed it is flagged
+  deliver-UNLOCKED (liquid). **Never silently caps an over-max lock** — an
+  over-`max_vault_duration` remaining is surfaced to the same operator queue
+  rather than downgraded to liquid.
 - **ANT**: `TransferV1` (Owner) + `UpdateV1` (UpdateAuthority) atomic, via the
   `ant` signer (ADR-013), mirroring `claim-transfers.ts::transferNft`.
 

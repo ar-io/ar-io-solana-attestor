@@ -68,9 +68,19 @@ export async function getLedgerProof(pool: Pool, assetKey: string, id?: string):
   };
 }
 
+/**
+ * Clamp a caller-supplied limit into `[1, max]`, defaulting a missing/non-finite
+ * value (e.g. `parseInt("abc") == NaN`) to `def`. Without this a bad `?limit=`
+ * query flows through as `NaN` and reaches the SQL as `LIMIT NaN` -> a 500.
+ */
+function clampLimit(limit: number | undefined, def: number, max: number): number {
+  const n = limit === undefined || !Number.isFinite(limit) ? def : Math.floor(limit);
+  return Math.min(Math.max(n, 1), max);
+}
+
 /** GET /v1/transparency/log — audit-log page + current head. */
 export async function getAuditLog(pool: Pool, opts: { sinceSeq?: string; limit?: number } = {}): Promise<unknown> {
-  const limit = Math.min(Math.max(opts.limit ?? 200, 1), 1000);
+  const limit = clampLimit(opts.limit, 200, 1000);
   const rows = await loadAuditRows(pool, { sinceSeq: opts.sinceSeq ?? "0", limit });
   const head = await getAuditHead(pool);
   return {
@@ -91,7 +101,7 @@ export async function getAnchorList(
   pool: Pool,
   opts: { kind?: "audit-head" | "ledger-root"; limit?: number } = {},
 ): Promise<{ anchors: AnchorRecord[] }> {
-  const anchors = await getAnchors(pool, { kind: opts.kind, limit: Math.min(opts.limit ?? 50, 500) });
+  const anchors = await getAnchors(pool, { kind: opts.kind, limit: clampLimit(opts.limit, 50, 500) });
   return { anchors };
 }
 

@@ -307,6 +307,7 @@ describe("M6 UAT — reserves false-surplus", { skip: !HAS_DB }, () => {
     async signTransaction(): Promise<never> { throw new Error("unused"); }
     async broadcast(): Promise<void> {}
     async confirmSignature(): Promise<"confirmed"> { return "confirmed"; }
+    async findConfirmedOutflow(): Promise<null> { return null; }
   }
 
   it("FIXED: cold reserve owner == hot dispenser owner is REJECTED (no double-count)", async () => {
