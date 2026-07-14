@@ -1,0 +1,57 @@
+{
+  "name": "@ar.io/claims",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Centralized claim-dispenser service (Option B) for the AO->Solana migration. M0 scaffold only: HTTP server + Postgres + config. Ledger, verification, and dispatch land in M1-M4.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "test": "node --test --import tsx $(find src -name '*.test.ts' | sort)",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "typecheck:tests": "tsc -p tsconfig.tests.json",
+    "migrate": "node-pg-migrate",
+    "migrate:up": "node-pg-migrate up",
+    "migrate:down": "node scripts/migrate-down-guard.mjs",
+    "migrate:create": "node-pg-migrate create",
+    "build:ledger": "tsx src/cli/build-ledger.ts",
+    "reconcile:ledger": "tsx src/cli/reconcile-ledger.ts",
+    "encrypt:treasury-key": "tsx src/cli/encrypt-treasury-key.ts",
+    "dispatch:worker": "tsx src/cli/dispatch-worker.ts",
+    "dispatch:ants": "tsx src/cli/dispatch-ants.ts",
+    "dispatch:approve": "tsx src/cli/approve-claim.ts",
+    "reconcile:dispatch": "tsx src/cli/reconcile-dispatch.ts",
+    "vault:manual-queue": "tsx src/cli/vault-manual-queue.ts",
+    "reap:challenges": "tsx src/cli/reap-challenges.ts",
+    "publish:ledger": "tsx src/cli/publish-ledger.ts",
+    "anchor:audit-log": "tsx src/cli/anchor-audit-log.ts",
+    "verify:transparency": "tsx src/cli/verify-transparency.ts",
+    "ops:metrics": "tsx src/cli/ops-metrics.ts",
+    "rehearsal:staging": "tsx scripts/staging-rehearsal.ts"
+  },
+  "dependencies": {
+    "@ar.io/attestor-canonical": "0.1.0",
+    "@noble/ed25519": "^2.1.0",
+    "@noble/hashes": "^1.5.0",
+    "@noble/secp256k1": "^2.3.0",
+    "@solana/kit": "^2.1.0",
+    "bs58": "^6.0.0",
+    "fastestsmallesttextencoderdecoder": "^1.0.22",
+    "fastify": "^5.2.0",
+    "node-pg-migrate": "^7.9.0",
+    "pg": "^8.13.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

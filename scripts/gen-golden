@@ -1,0 +1,107 @@
+#!/usr/bin/env node
+/*
+ * gen-golden — regenerate packages/canonical/src/canonical.cross.golden.json
+ * from the on-chain Rust `canonical` example (ario-ant-escrow).
+ *
+ * The golden vectors pin the FROZEN, deployed-contract canonical byte format.
+ * Layer 1 of canonical.cross.test.ts asserts the TS builders against them on
+ * every CI run (no cargo); Layer 2 re-derives from live Rust to catch drift.
+ * Run this ONLY when the contract canonical format changes on purpose.
+ *
+ * It keeps every vector's INPUTS (network, recipientPubkeyHex, ids, amounts,
+ * nonces, claimants) and rewrites only each `canonicalHex` from the Rust
+ * binary — the exact same binary + argv the cross test's Layer 2 invokes, so a
+ * regenerated file is guaranteed consistent with live Rust.
+ *
+ * Usage:
+ *   [CONTRACTS_REPO_DIR=/path/to/ar-io-solana-contracts] node scripts/gen-golden
+ * Requires: cargo + the ar-io-solana-contracts repo (sibling clone by default).
+ */
+"use strict";
+
+const { execFileSync, spawnSync } = require("node:child_process");
+const { existsSync, readFileSync, writeFileSync } = require("node:fs");
+const { resolve } = require("node:path");
+
+const REPO_ROOT = resolve(__dirname, "..");
+const GOLDEN_PATH = resolve(
+  REPO_ROOT,
+  "packages/canonical/src/canonical.cross.golden.json",
+);
+
+function findContractsDir() {
+  const override = process.env.CONTRACTS_REPO_DIR;
+  const candidates = override
+    ? [override]
+    : [resolve(REPO_ROOT, "..", "ar-io-solana-contracts")];
+  for (const dir of candidates) {
+    if (existsSync(resolve(dir, "programs/ario-ant-escrow/examples/canonical.rs"))) {
+      return dir;
+    }
+  }
+  return null;
+}
+
+function main() {
+  const contractsDir = findContractsDir();
+  if (!contractsDir) {
+    console.error(
+      "gen-golden: ar-io-solana-contracts not found. Set CONTRACTS_REPO_DIR or " +
+        "place the sibling clone at ../ar-io-solana-contracts.",
+    );
+    process.exit(1);
+  }
+
+  const probe = spawnSync("cargo", ["--version"], { stdio: "ignore" });
+  if (probe.error || probe.status !== 0) {
+    console.error("gen-golden: cargo is not on PATH — install the Rust toolchain.");
+    process.exit(1);
+  }
+
+  console.error(`gen-golden: building Rust canonical example in ${contractsDir} ...`);
+  const build = spawnSync(
+    "cargo",
+    ["build", "--example", "canonical", "-p", "ario-ant-escrow"],
+    { cwd: contractsDir, stdio: "inherit" },
+  );
+  const bin = resolve(contractsDir, "target/debug/examples/canonical");
+  if (build.error || build.status !== 0 || !existsSync(bin)) {
+    console.error("gen-golden: failed to build the Rust canonical example.");
+    process.exit(1);
+  }
+
+  const golden = JSON.parse(readFileSync(GOLDEN_PATH, "utf8"));
+  const recipientHex = golden.recipientPubkeyHex;
+
+  const runHex = (args) =>
+    Buffer.from(execFileSync(bin, args, { encoding: "buffer" })).toString("hex");
+
+  let changed = 0;
+  for (const v of golden.ant ?? []) {
+    const hex = runHex([v.antMintBase58, v.claimantBase58, v.nonceHex, recipientHex]);
+    if (hex !== v.canonicalHex) changed++;
+    v.canonicalHex = hex;
+  }
+  for (const v of golden.escrow ?? []) {
+    const hex = runHex([
+      "--escrow",
+      v.assetType,
+      v.assetIdHex,
+      v.amount,
+      v.claimantBase58,
+      v.nonceHex,
+      recipientHex,
+    ]);
+    if (hex !== v.canonicalHex) changed++;
+    v.canonicalHex = hex;
+  }
+
+  writeFileSync(GOLDEN_PATH, `${JSON.stringify(golden, null, 2)}\n`);
+  console.error(
+    `gen-golden: wrote ${GOLDEN_PATH} (${golden.ant.length} ANT + ` +
+      `${golden.escrow.length} escrow vectors; ${changed} canonicalHex changed).`,
+  );
+  console.error("gen-golden: now run `yarn test` to confirm Layer 1 passes.");
+}
+
+main();

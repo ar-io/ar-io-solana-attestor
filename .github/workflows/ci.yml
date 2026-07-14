@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feat/ar-io-claims]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: install / lint / typecheck / test
+    runs-on: ubuntu-latest
+
+    # Postgres service container for the claims workspace: exercised by
+    # the migration step (the empty M0 migration must apply against a
+    # fresh DB) and available to any DB-touching tests added later.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: claims
+          POSTGRES_PASSWORD: claims
+          POSTGRES_DB: claims
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U claims -d claims"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      NETWORK: localnet
+      DATABASE_URL: postgres://claims:claims@localhost:5432/claims
+      # Canonical parity is fail-closed via a TWO-LAYER golden design:
+      #   Layer 1 (golden vectors) — TS builders vs canonical.cross.golden.json,
+      #     the frozen deployed-contract bytes. ALWAYS runs here, no Rust
+      #     toolchain, and HARD-FAILS on any TS drift.
+      #   Layer 2 (live-Rust drift) — re-derives from a freshly built Rust
+      #     example to catch a contract-side canonical change. Needs cargo + the
+      #     contracts repo, so it is a VISIBLE skip in CI (turned into a hard
+      #     fail only under REQUIRE_RUST_PARITY=1 — see the N3 TODO at EOF).
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Enable Corepack (pins yarn to packageManager field)
+        run: corepack enable
+
+      - name: Install (frozen lockfile)
+        run: yarn install --frozen-lockfile
+
+      - name: Build (shared lib first, then services)
+        run: yarn build
+
+      - name: Lint + typecheck (tsc --noEmit across workspaces)
+        run: yarn lint
+
+      - name: Typecheck claims test files
+        working-directory: packages/claims
+        run: yarn typecheck:tests
+
+      - name: Apply claims migrations (empty initial migration)
+        working-directory: packages/claims
+        run: yarn migrate:up
+
+      # Runs every workspace's tests: canonical Layer-1 golden parity (fail-
+      # closed, no Rust), the attestor suite, and the claims M1 ledger + reconcile
+      # unit tests. The claims DB round-trip test runs against the Postgres
+      # service (DATABASE_URL above); the M1 reconciliation GATE itself is a
+      # local/ops run (needs the solana-ar-io repo + the frozen mainnet inputs +
+      # ANT_MINT_SECRET), so it is not wired into CI — see SPEC.md.
+      - name: Test (all workspaces)
+        run: yarn test
+
+# --- TODO (M7): N3 — scheduled live-Rust parity job ---------------------------
+# Add a `schedule:`-triggered job (or a separate workflow) that checks out
+# ar-io-solana-contracts, installs the Rust toolchain, and runs the canonical
+# cross test under REQUIRE_RUST_PARITY=1 so Layer 2 (live-Rust drift detection)
+# runs on a cadence — catching a contract-side canonical change the frozen
+# golden file would not otherwise see. Deferred to M7 (ops hardening); NOT built
+# now.
