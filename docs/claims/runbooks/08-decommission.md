@@ -24,15 +24,19 @@ executable checklist — tick each box.
 
 ## T-0 — freeze the claim window
 
-- [ ] **Freeze the API.** Set every remaining `available` asset to `frozen` so the
-      API returns `CLAIM_WINDOW_CLOSED` + a support contact:
+- [ ] **Freeze the API.** Set every remaining `available` asset to `frozen`. A
+      `frozen` asset makes the API return **409 `ASSET_FROZEN`** (see
+      `src/api/service.ts`); it does NOT return a `CLAIM_WINDOW_CLOSED` code — no such
+      code exists in the current build. (If you want a distinct
+      `CLAIM_WINDOW_CLOSED` response with a support contact, add that status→code
+      mapping in code first; it is not there today.)
       ```sql
-      -- production: run as the append-only-respecting admin path, or:
+      -- No admin freeze/cancel endpoint exists yet (see known gap below); until one
+      -- is built, this is a MANUAL, audited DB transition — append a compensating
+      -- audit_log row for the batch so the append-only chain stays coherent:
       UPDATE assets SET status='frozen', updated_at=now()
        WHERE status IN ('available','pending_review');   -- leave 'claimed'/'cancelled' alone
       ```
-      (Prefer the admin `cancel`/freeze endpoints so each transition is
-      **audit-logged** — do not bypass the audit log.)
 - [ ] **Stop the dispatch worker** after the last in-flight `dispatching` claim
       resolves (let recovery finalize them first — `yarn reconcile:dispatch`
       should show no `dispatching` rows).

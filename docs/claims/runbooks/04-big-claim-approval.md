@@ -71,9 +71,23 @@ approving more.
 ## AT-RISK owners (136 wallets, ~6.25M ARIO)
 
 These load `manual_review` and are **hidden** from self-serve lookup/claim (the API
-returns a 404 indistinguishable from a nonexistent asset). They arrange delivery
-by email. The flow: the owner proves control of their modulus/pubkey (signs a
-challenge), an operator verifies `sha256(modulus) == address`, attaches the key via
-the admin `attach-pubkey` endpoint, and only then does the normal claim path open —
-still subject to this >100k review. Do **not** shortcut the identity proof for an
-AT-RISK owner.
+returns a 404 indistinguishable from a nonexistent asset). They arrange delivery by
+email. The flow when one of the 136 later publishes a key and contacts support:
+
+1. The owner proves control of their modulus/pubkey (signs a challenge); an operator
+   verifies `sha256(modulus) == address`.
+2. **Re-attach the recipient — a MANUAL, carefully-audited DB operation.** There is
+   **no admin endpoint for this** (`src/api/routes.ts` exposes no admin/`attach-pubkey`
+   route — this is a known gap, see below). Until one exists, an operator adds the
+   recipient's now-known 512-byte RSA modulus to `recipients.recipient_pubkey` and
+   flips their asset rows from `manual_review` to `available`, appending a compensating
+   `audit_log` entry for the change.
+3. The normal claim path then opens — still subject to this >100k review.
+
+> **This bypasses the normal ledger build/reconcile gate** (it mutates the ledger
+> outside `build:ledger`), so do it deliberately and follow up with
+> `yarn reconcile:dispatch` (and, if you re-published, `yarn reconcile:ledger`) to
+> confirm nothing else drifted. A guarded admin `attach-pubkey` endpoint is a
+> possible future addition; today the re-attach is manual.
+
+Do **not** shortcut the identity proof for an AT-RISK owner.

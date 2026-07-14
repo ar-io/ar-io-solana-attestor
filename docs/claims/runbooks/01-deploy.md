@@ -22,8 +22,17 @@ then mainnet. Two long-lived processes + scheduled jobs:
    `audit_log` (append-only invariant — see README). Apply migrations:
    `yarn migrate:up`.
 4. **Ledger built + reconciled** (M1): `yarn build:ledger` then
-   `SNAPSHOT_DIR=<pruned> yarn reconcile:ledger` → **must PASS bit-exact** before
-   any claim can be served. The 136 AT-RISK owners load `manual_review`.
+   `yarn reconcile:ledger` → **must PASS bit-exact** (exit 0) before any claim can
+   be served. Both CLIs read `FROZEN_INPUTS_DIR` (the frozen mainnet capture),
+   `ANT_MINT_SECRET`, and `DATABASE_URL` from env — there is no `SNAPSHOT_DIR`
+   argument. Typical invocation:
+   ```bash
+   FROZEN_INPUTS_DIR=/programs/ario-snapshot/output-mainnet-prod-remediation \
+     ANT_MINT_SECRET='…' DATABASE_URL='…' yarn build:ledger
+   FROZEN_INPUTS_DIR=/programs/ario-snapshot/output-mainnet-prod-remediation \
+     ANT_MINT_SECRET='…' RECONCILE_SOURCE=db DATABASE_URL='…' yarn reconcile:ledger
+   ```
+   The 136 AT-RISK owners load `manual_review`.
 5. `.env` from a secret manager (never a file in prod). See
    [`.env.example`](../../../packages/claims/.env.example).
 
