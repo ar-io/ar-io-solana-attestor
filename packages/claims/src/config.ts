@@ -54,9 +54,28 @@ export interface Config {
    * ops boundary is enforced, not merely documented (MEDIUM-4).
    */
   metricsAuthToken?: string;
+  /**
+   * ANT dispatch custody mode (ANT_OPERATOR_SIGNING_SPEC.md §7.5). `cli-cold`
+   * (DEFAULT) keeps the existing break-glass `dispatch:ants` path with an
+   * operator-supplied cold keypair; `operator-wallet` enables the wallet-signed
+   * admin flow and boot REFUSES any persistent server-held ANT key. Default is
+   * `cli-cold` so production behavior is unchanged until explicitly flipped.
+   */
+  antDispatchMode?: AntDispatchMode;
+  /** Gate ANT eligibility on operator approval. Default false (decided): the
+   *  operator signing session IS the human gate; verified ANTs flow straight in. */
+  antRequiresApproval?: boolean;
+  /** Max txs offered per operator build/sign session (ANT_BATCH_MAX). Default 50. */
+  antBatchMax?: number;
+  /** Reservation TTL (ms): an abandoned batch frees its claims after this. Default 10 min. */
+  antReservationTtlMs?: number;
+  /** The ANT-authority pubkey (base58). Required when antDispatchMode=operator-wallet. */
+  antColdAddress?: string;
 }
 
 export type Network = "solana-mainnet" | "solana-devnet" | "localnet";
+export type AntDispatchMode = "operator-wallet" | "cli-cold";
+const VALID_ANT_MODES: readonly AntDispatchMode[] = ["operator-wallet", "cli-cold"];
 
 const VALID_NETWORKS: readonly Network[] = [
   "solana-mainnet",
@@ -110,6 +129,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
 
+  const antDispatchMode = (env.ANT_DISPATCH_MODE ?? "cli-cold") as AntDispatchMode;
+  if (!VALID_ANT_MODES.includes(antDispatchMode)) {
+    throw new Error(`ANT_DISPATCH_MODE must be one of ${VALID_ANT_MODES.join(", ")}, got "${env.ANT_DISPATCH_MODE}"`);
+  }
+  const antBatchMax = parseInt(env.ANT_BATCH_MAX ?? "50", 10);
+  if (!Number.isInteger(antBatchMax) || antBatchMax <= 0) {
+    throw new Error(`ANT_BATCH_MAX must be a positive integer, got "${env.ANT_BATCH_MAX}"`);
+  }
+  const antReservationTtlMs = parseInt(env.ANT_RESERVATION_TTL_MS ?? "600000", 10);
+  if (!Number.isInteger(antReservationTtlMs) || antReservationTtlMs <= 0) {
+    throw new Error(`ANT_RESERVATION_TTL_MS must be a positive integer, got "${env.ANT_RESERVATION_TTL_MS}"`);
+  }
+
   return {
     port,
     host: env.HOST ?? "0.0.0.0",
@@ -124,6 +156,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     corsOrigin: env.CORS_ORIGIN ?? "*",
     trustProxy: parseTrustProxy(env.TRUST_PROXY),
     metricsAuthToken: env.METRICS_AUTH_TOKEN && env.METRICS_AUTH_TOKEN.length > 0 ? env.METRICS_AUTH_TOKEN : undefined,
+    antDispatchMode,
+    antRequiresApproval: (env.ANT_REQUIRES_APPROVAL ?? "false") === "true",
+    antBatchMax,
+    antReservationTtlMs,
+    antColdAddress: env.ANT_COLD_ADDRESS && env.ANT_COLD_ADDRESS.length > 0 ? env.ANT_COLD_ADDRESS : undefined,
   };
 }
 

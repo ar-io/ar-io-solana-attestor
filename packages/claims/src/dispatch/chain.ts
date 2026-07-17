@@ -88,6 +88,27 @@ export interface OutflowScanParams {
   limit?: number;
 }
 
+/** A fresh blockhash + its lastValidBlockHeight (for building a tx lifetime). */
+export interface LatestBlockhash {
+  blockhash: string;
+  lastValidBlockHeight: bigint;
+}
+
+/**
+ * The subset of chain access the operator-wallet ANT flow needs (ant-operator.ts).
+ * `latestBlockhash` is NOT part of the core `ChainGateway` (the worker never needs
+ * it — it signs via `signTransaction`); the live `SolanaChainGateway` and the test
+ * `FakeChainGateway` both provide all of these, so either satisfies this
+ * structurally without a change to `ChainGateway`.
+ */
+export interface AntChainGateway {
+  latestBlockhash(): Promise<LatestBlockhash>;
+  broadcast(wireBase64: string): Promise<void>;
+  confirmSignature(signature: string, lastValidBlockHeight: bigint): Promise<ConfirmState>;
+  findConfirmedOutflow(params: OutflowScanParams): Promise<OutflowMatch | null>;
+  getBlockHeight(): Promise<bigint>;
+}
+
 export interface ChainGateway {
   /** SPL token balance of `ata` in mARIO; 0n if the account does not exist. */
   getTokenBalance(ata: Address): Promise<bigint>;
@@ -159,6 +180,11 @@ export class SolanaChainGateway implements ChainGateway {
 
   async getBlockHeight(): Promise<bigint> {
     return this.#rpc.getBlockHeight().send();
+  }
+
+  async latestBlockhash(): Promise<LatestBlockhash> {
+    const { value } = await this.#rpc.getLatestBlockhash({ commitment: "confirmed" }).send();
+    return { blockhash: value.blockhash, lastValidBlockHeight: value.lastValidBlockHeight };
   }
 
   async signTransaction(

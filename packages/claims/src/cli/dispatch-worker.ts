@@ -95,6 +95,8 @@ async function main(): Promise<void> {
     vaultDurations: dispatch.vaultDurations,
     arioCoreProgram: dispatch.arioCoreProgram,
     antRequiresApproval: dispatch.antRequiresApproval,
+    // B1: in operator-wallet mode the automated worker must NOT touch ANT claims.
+    antDispatchMode: config.antDispatchMode,
     log: (msg, extra) => console.log(JSON.stringify({ msg, ...extra })), // eslint-disable-line no-console
   });
 

@@ -12,9 +12,16 @@
 //!                         even for a landed tx (crash after land, before finalize).
 
 import { Buffer } from "node:buffer";
-import type { Address, IInstruction, TransactionSigner } from "@solana/kit";
+import {
+  getBase64Encoder,
+  getSignatureFromTransaction,
+  getTransactionDecoder,
+  type Address,
+  type IInstruction,
+  type TransactionSigner,
+} from "@solana/kit";
 
-import type { ChainGateway, ConfirmState, OutflowMatch, OutflowScanParams, SignedDispatch } from "./chain.js";
+import type { ChainGateway, ConfirmState, LatestBlockhash, OutflowMatch, OutflowScanParams, SignedDispatch } from "./chain.js";
 
 interface TxState {
   landed: boolean;
@@ -60,6 +67,12 @@ export class FakeChainGateway implements ChainGateway {
     return this.blockHeight;
   }
 
+  async latestBlockhash(): Promise<LatestBlockhash> {
+    this.blockhashCount += 1;
+    return { blockhash: `BLKLATEST${this.blockhashCount}`, lastValidBlockHeight: this.blockHeight + 150n };
+  }
+  blockhashCount = 0;
+
   async signTransaction(
     ixs: IInstruction[],
     _feePayer: TransactionSigner,
@@ -83,8 +96,28 @@ export class FakeChainGateway implements ChainGateway {
     this.broadcasts.push(wireBase64);
     if (this.dropBroadcast) return;
     const sig = this.#wireToSig.get(wireBase64);
-    const t = sig ? this.#txs.get(sig) : undefined;
-    if (t) t.landed = true;
+    if (sig) {
+      // Worker path: a tx we signed via signTransaction() (known by wire bytes).
+      const t = this.#txs.get(sig);
+      if (t) t.landed = true;
+      return;
+    }
+    // Operator-wallet path: an EXTERNALLY-built tx (treasury-signed fee-payer slot
+    // + operator authority signature). Decode it to recover its txid (== the
+    // fee-payer signature) and land it under that signature — exactly what a real
+    // validator does. Ignore undecodable bytes (a real node would reject them).
+    try {
+      const decoded = getTransactionDecoder().decode(new Uint8Array(getBase64Encoder().encode(wireBase64)));
+      const txid = getSignatureFromTransaction(decoded);
+      const existing = this.#txs.get(txid);
+      if (existing) {
+        existing.landed = true;
+      } else {
+        this.#txs.set(txid, { landed: true, err: this.failOnLand, lastValid: this.blockHeight + 150n });
+      }
+    } catch {
+      // not a decodable tx — model a validator rejecting it (no land).
+    }
   }
 
   async confirmSignature(signature: string, lastValidBlockHeight: bigint): Promise<ConfirmState> {

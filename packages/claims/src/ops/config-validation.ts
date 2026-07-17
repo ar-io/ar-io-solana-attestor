@@ -100,6 +100,10 @@ export function validateBootConfig(
   }
   const rpc = env.SOLANA_RPC_URL;
   const confirmRpc = env.CONFIRM_RPC_URL ?? rpc;
+  const antMode = env.ANT_DISPATCH_MODE ?? "cli-cold";
+  // operator-wallet ANT-admin hosting relies on the same confirm/recover reads as
+  // the worker, so it demands worker-grade single-endpoint confirm-RPC.
+  const confirmRpcCritical = role === "worker" || antMode === "operator-wallet";
   const isMainnet = network === "solana-mainnet";
   const isDevnet = network === "solana-devnet";
   const hostHints = `${rpc ?? ""} ${confirmRpc ?? ""}`.toLowerCase();
@@ -125,17 +129,18 @@ export function validateBootConfig(
     }
   }
 
-  // -- Single-consistent CONFIRM RPC (fatal for the worker; warn elsewhere) --
+  // -- Single-consistent CONFIRM RPC (fatal for the worker AND operator-wallet
+  //    ANT-admin hosting; warn elsewhere) --
   if (confirmRpc && looksPooled(confirmRpc)) {
     const msg =
       `CONFIRM RPC "${confirmRpc}" looks like a load-balanced / multi-endpoint pool. ` +
       "Exactly-once dispatch REQUIRES a single consistent endpoint (or a read quorum) — " +
       "a lagging replica can misclassify a landed tx as dead and DOUBLE-SEND.";
-    if (role === "worker") err("CONFIRM_RPC_POOLED", msg);
+    if (confirmRpcCritical) err("CONFIRM_RPC_POOLED", msg);
     else warn("CONFIRM_RPC_POOLED", msg);
   }
-  if (role === "worker" && !confirmRpc) {
-    err("CONFIRM_RPC_MISSING", "the dispatch worker needs CONFIRM_RPC_URL (or SOLANA_RPC_URL) set to a single consistent endpoint");
+  if (confirmRpcCritical && !confirmRpc) {
+    err("CONFIRM_RPC_MISSING", "the dispatch worker / operator ANT-admin host needs CONFIRM_RPC_URL (or SOLANA_RPC_URL) set to a single consistent endpoint");
   }
 
   // -- The FIVE distinct keys ----------------------------------------------
@@ -151,6 +156,33 @@ export function validateBootConfig(
       );
     } else {
       seen.set(address, label);
+    }
+  }
+
+  // -- ANT dispatch mode (operator wallet-signed vs cli-cold) --------------
+  // Default `cli-cold` — nothing changes until explicitly flipped. When
+  // `operator-wallet`, the ANT authority MUST live only in the operator's wallet:
+  // boot REFUSES any persistent server-held ANT key, and ANT_COLD_ADDRESS (the
+  // authority pubkey the admin endpoints bind to) is required. (`antMode` computed
+  // above, near the confirm-RPC posture check.)
+  if (antMode !== "cli-cold" && antMode !== "operator-wallet") {
+    err("ANT_DISPATCH_MODE_INVALID", `ANT_DISPATCH_MODE must be "operator-wallet" or "cli-cold", got "${antMode}"`);
+  }
+  if (antMode === "operator-wallet") {
+    const serverAntKeys = [
+      "ANT_SIGNER_KEY_SEALED_PATH",
+      "ANT_SIGNER_SEED_BASE64",
+      "ANT_COLD_KEY_SEALED_PATH",
+      "ANT_COLD_KEYPAIR_PATH",
+    ].filter((k) => env[k]);
+    for (const k of serverAntKeys) {
+      err(
+        "ANT_OPERATOR_MODE_SERVER_KEY",
+        `${k} is set with ANT_DISPATCH_MODE=operator-wallet — the ANT authority MUST stay in the operator's wallet; a persistent server-held ANT key is refused in operator-wallet mode`,
+      );
+    }
+    if (!env.ANT_COLD_ADDRESS) {
+      err("ANT_COLD_ADDRESS_MISSING", "ANT_DISPATCH_MODE=operator-wallet requires ANT_COLD_ADDRESS (the ANT-authority pubkey the admin endpoints bind to)");
     }
   }
 

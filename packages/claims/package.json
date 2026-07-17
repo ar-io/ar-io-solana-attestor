@@ -22,6 +22,7 @@
     "encrypt:treasury-key": "tsx src/cli/encrypt-treasury-key.ts",
     "dispatch:worker": "tsx src/cli/dispatch-worker.ts",
     "dispatch:ants": "tsx src/cli/dispatch-ants.ts",
+    "admin:serve": "tsx src/cli/ant-admin-serve.ts",
     "dispatch:approve": "tsx src/cli/approve-claim.ts",
     "reconcile:dispatch": "tsx src/cli/reconcile-dispatch.ts",
     "vault:manual-queue": "tsx src/cli/vault-manual-queue.ts",

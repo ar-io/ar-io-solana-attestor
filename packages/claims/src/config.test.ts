@@ -51,6 +51,30 @@ describe("parseTrustProxy (MEDIUM-3)", () => {
   });
 });
 
+describe("loadConfig — ANT operator dispatch settings", () => {
+  it("defaults: cli-cold mode, approval off, batch max 50, ttl 10 min", () => {
+    const c = loadConfig(base);
+    assert.equal(c.antDispatchMode, "cli-cold");
+    assert.equal(c.antRequiresApproval, false);
+    assert.equal(c.antBatchMax, 50);
+    assert.equal(c.antReservationTtlMs, 600000);
+    assert.equal(c.antColdAddress, undefined);
+  });
+  it("parses operator-wallet mode + overrides", () => {
+    const c = loadConfig({ ...base, ANT_DISPATCH_MODE: "operator-wallet", ANT_REQUIRES_APPROVAL: "true", ANT_BATCH_MAX: "25", ANT_RESERVATION_TTL_MS: "1000", ANT_COLD_ADDRESS: "AntCoLdAddr1111111111111111111111111111111" });
+    assert.equal(c.antDispatchMode, "operator-wallet");
+    assert.equal(c.antRequiresApproval, true);
+    assert.equal(c.antBatchMax, 25);
+    assert.equal(c.antReservationTtlMs, 1000);
+    assert.equal(c.antColdAddress, "AntCoLdAddr1111111111111111111111111111111");
+  });
+  it("rejects an invalid mode / non-positive batch max / ttl", () => {
+    assert.throws(() => loadConfig({ ...base, ANT_DISPATCH_MODE: "nope" }), /ANT_DISPATCH_MODE/);
+    assert.throws(() => loadConfig({ ...base, ANT_BATCH_MAX: "0" }), /ANT_BATCH_MAX/);
+    assert.throws(() => loadConfig({ ...base, ANT_RESERVATION_TTL_MS: "-1" }), /ANT_RESERVATION_TTL_MS/);
+  });
+});
+
 describe("loadConfig — metrics auth token (MEDIUM-4)", () => {
   it("is undefined when unset or empty", () => {
     assert.equal(loadConfig(base).metricsAuthToken, undefined);
