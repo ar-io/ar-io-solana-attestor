@@ -16,17 +16,29 @@
 //!   6  vault-expired    -> confirmed liquid, balance == amount
 //!   7  >100k claim      -> complete=pending_review -> operator approve -> confirmed
 //!   8  ANT cold-batch   -> a SINGLE runAntBatch(cold) dispenses BOTH ANTs at once
+//!   9  AR-ANT OPERATOR-WALLET -> buildAntBatch (treasury fee-payer, txid known) ->
+//!         operator wallet signs (sign-only) -> submitAntBatch -> on-chain Owner+UA
+//!         == claimant, DB confirmed/claimed, memo ar.io-claim:<id> on the landed tx.
+//!         The ANT authority key never lives on the server; the treasury pays the fee.
 //! Then: reconcile-dispatch PASS; publish signed ledger + third-party verify +
 //! membership; anchor audit head on-chain + read-back + extension check + signer
 //! pin; reserves endpoint (holdings >= liabilities).
 //!
 //! Run (devnet, funded by the staging authority):
 //!   NETWORK=solana-devnet SOLANA_RPC_URL=https://api.devnet.solana.com \
+//!   SOLANA_WS_URL=wss://api.devnet.solana.com \
 //!   FUNDER_KEYPAIR=/home/vilenarios/source/solana-ar-io/keys/staging/authority-keypair.json \
 //!   DATABASE_URL=postgres://claims:claims@localhost:5432/claims \
 //!     tsx scripts/staging-rehearsal.ts
 //! (or against a surfpool mainnet-fork localnet: SOLANA_RPC_URL=http://127.0.0.1:8899,
 //!  no FUNDER_KEYPAIR — SOL comes from airdrops.)
+//!
+//! Row 9 (operator-wallet ANT) needs NO extra manual keys: the leg GENERATES the
+//! devnet ANT-authority keypair internally (it stands in for the operator's Phantom
+//! — it both owns the minted asset and signs the batch, and holds ZERO SOL because
+//! the treasury is the fee payer). `ANT_DISPATCH_MODE=operator-wallet` is implied by
+//! running this leg (it drives buildAntBatch/submitAntBatch directly, not the worker).
+//! The FUNDER (or airdrop) funds the treasury for the trivial ANT base fee.
 
 import { randomBytes } from "node:crypto";
 import { Buffer } from "node:buffer";
@@ -45,8 +57,12 @@ import {
   generateKeyPairSigner,
   getAddressDecoder,
   getAddressEncoder,
+  getBase64Encoder,
+  getBase64EncodedWireTransaction,
   getSignatureFromTransaction,
+  getTransactionDecoder,
   lamports,
+  partiallySignTransaction,
   pipe,
   sendAndConfirmTransactionFactory,
   setTransactionMessageFeePayerSigner,
@@ -73,9 +89,11 @@ import {
   SYSTEM_PROGRAM,
   TOKEN_PROGRAM,
   MPL_CORE_PROGRAM,
+  MEMO_PROGRAM,
   createAtaIdempotentIx,
   getAssociatedTokenAddress,
 } from "../src/dispatch/instructions.js";
+import { buildAntBatch, submitAntBatch } from "../src/dispatch/ant-operator.js";
 import {
   makeArIdentity,
   makeEthIdentity,
@@ -498,6 +516,69 @@ async function main(): Promise<void> {
   expect("row2_ar_ant_cold_batch", okAr && gateAr.outcome === "awaiting_approval" && ownAr.owner === cAr && ownAr.ua === cAr, `owner=${ownAr.owner} ua=${ownAr.ua} claimant=${cAr}`);
   expect("row4_eth_ant_cold_batch", okEth && gateEth.outcome === "awaiting_approval" && ownEth.owner === cEth && ownEth.ua === cEth, `owner=${ownEth.owner} ua=${ownEth.ua} claimant=${cEth}`);
   expect("row8_cold_batch_dispenses_both", batch.filter((x) => x.outcome === "confirmed").length >= 2, `batch confirmed=${batch.filter((x) => x.outcome === "confirmed").length}`);
+
+  // ---- Row 9: AR-ANT via OPERATOR-WALLET signing (buildAntBatch -> operator signs -> submitAntBatch) ----
+  // The ANT authority key NEVER lives on the server. The operator's wallet (here a
+  // locally-generated devnet keypair standing in for Phantom) both OWNS the asset and
+  // signs the batch; the TREASURY (hot dispenser) is the fee payer, so the authority
+  // wallet needs ZERO SOL. Exercises the real chain end-to-end: buildAntBatch (treasury
+  // co-signs the fee-payer slot -> txid known + persisted) -> operator sign-only ->
+  // submitAntBatch (server reconstructs from its stored message + broadcasts + confirms).
+  log("Row 9: AR-ANT via operator-wallet signing (treasury fee-payer; authority in-wallet)");
+  const antAuthorityKp = await generateKeyPairSigner(); // == the operator's Phantom (zero SOL)
+  const arOpAntId = makeArIdentity();
+  await seedRecipientAr(arOpAntId);
+  const cOp = await claimant();
+  // Mint a real MPL Core asset OWNED (owner + update-authority) by the operator authority.
+  const opAntMint = await createCoreAsset(payer, antAuthorityKp, "op-ant");
+  await seedAsset(arOpAntId.recipientId, { assetKey: opAntMint as string, assetType: "ant", antMint: opAntMint as string });
+  // Drive the API to a genuine `verified` claim (asset -> claiming), same shape as the
+  // other ANT legs, so buildAntBatch (ANT_REQUIRES_APPROVAL=false) picks it up.
+  const dOp = await driveComplete(app, { recipientId: arOpAntId.recipientId, assetKey: opAntMint as string, claimant: cOp, sign: arProof(arOpAntId) });
+
+  // BUILD: the TREASURY (hot dispenser) co-signs the fee-payer slot; the server learns
+  // + persists the final txid BEFORE the operator ever co-signs. Scope to THIS asset.
+  const opBatch = await buildAntBatch(db.pool, hotKp, gateway, {
+    antColdAddress: antAuthorityKp.address, max: 50, requireApproval: false, assetKeyScope: [opAntMint as string],
+  });
+  const opItem = opBatch.items.find((i) => i.claimId === dOp.claimId);
+
+  // OPERATOR SIGNS (sign-only; == Phantom `signAllTransactions`): add the AUTHORITY
+  // signature to the SERVER-built partial tx with a real @solana/kit signer. The txid
+  // (the treasury fee-payer signature) is invariant to this co-signature.
+  const opSignedTxs: string[] = [];
+  if (opItem) {
+    const decoded = getTransactionDecoder().decode(new Uint8Array(getBase64Encoder().encode(opItem.txBase64)));
+    const opSigned = await partiallySignTransaction([antAuthorityKp.keyPair], decoded);
+    opSignedTxs.push(getBase64EncodedWireTransaction(opSigned));
+  }
+
+  // SUBMIT: server verifies the authority sig over ITS OWN stored message, reconstructs
+  // the wire, then broadcasts + confirms on the REAL devnet gateway.
+  const opResults = await submitAntBatch(db.pool, gateway, {
+    batchId: opBatch.batchId, signedTxs: opSignedTxs,
+    antColdAddress: antAuthorityKp.address, treasuryAddress: hotKp.address,
+  });
+  const opRes = opResults[0];
+
+  // ASSERT ON-CHAIN (the point): the asset's Owner AND UpdateAuthority both moved to
+  // the claimant; DB claim -> confirmed, asset -> claimed; the ar.io-claim memo landed.
+  const opOwn = await readCoreOwnerUA(opAntMint);
+  const opClaimStatus = (await db.pool.query<{ status: string }>("SELECT status FROM claims WHERE claim_id=$1", [dOp.claimId])).rows[0]?.status;
+  const opAssetStatus = (await db.pool.query<{ status: string }>("SELECT status FROM assets WHERE asset_key=$1", [opAntMint as string])).rows[0]?.status;
+  const opMemo = opRes?.txid ? await fetchAnchorMemo(rpc, opRes.txid, MEMO_PROGRAM as string) : null;
+  const opMemoOk = opMemo?.memo === `ar.io-claim:${dOp.claimId}`;
+  expect(
+    "row9_ar_ant_operator_wallet",
+    dOp.status === "verified"
+      && opBatch.items.length === 1 && !!opItem
+      && opRes?.outcome === "confirmed"
+      && opOwn.owner === cOp && opOwn.ua === cOp
+      && opClaimStatus === "confirmed" && opAssetStatus === "claimed"
+      && opMemoOk,
+    `complete=${dOp.status} items=${opBatch.items.length} submit=${opRes?.outcome} owner=${opOwn.owner} ua=${opOwn.ua} claimant=${cOp} claim=${opClaimStatus} asset=${opAssetStatus} memo=${opMemo?.memo ?? "none"} txid=${opRes?.txid}`,
+  );
+  if (opRes?.txid) artifacts.row9_tx = opRes.txid;
 
   // ---- reconcile-dispatch ----
   log("reconcile-dispatch (Σ dispatched == Σ claimed; no double-dispense)");
