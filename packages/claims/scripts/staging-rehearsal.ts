@@ -477,7 +477,10 @@ async function main(): Promise<void> {
   const d5 = await driveComplete(app, { recipientId: arVaultId.recipientId, assetKey: ak5, claimant: c5, sign: arProof(arVaultId) });
   const r5 = await worker.processClaim(d5.claimId);
   const st5 = (await db.pool.query<{ status: string }>("SELECT status FROM assets WHERE asset_key=$1", [ak5])).rows[0].status;
-  expect("row5_vault_active_relock_routed", r5.outcome === "routed_to_review" && st5 === "pending_review", `dispatch=${r5.outcome} assetStatus=${st5}`);
+  // An ACTIVE (still-locked) vault relock routes to the MANUAL operator delivery
+  // queue (worker.ts `settlement.kind === "relock"`), NOT the big-claim brake:
+  // outcome `awaiting_manual_vault_delivery`, asset held `pending_review`.
+  expect("row5_vault_active_relock_routed", r5.outcome === "awaiting_manual_vault_delivery" && st5 === "pending_review", `dispatch=${r5.outcome} assetStatus=${st5}`);
 
   // ---- Row 7: >100k -> pending_review -> approve -> confirmed ----
   log("Row 7: >100k big-claim (review -> approve -> dispatch)");
