@@ -9,7 +9,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
-    "test": "node --test --import tsx $(find src -name '*.test.ts' | sort)",
+    "test": "node --test --test-concurrency=1 --import tsx $(find src -name '*.test.ts' | sort)",
     "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "typecheck:tests": "tsc -p tsconfig.tests.json",
