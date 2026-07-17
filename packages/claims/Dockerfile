@@ -21,9 +21,14 @@ COPY packages/claims/package.json ./packages/claims/
 # (supply-chain hardening). Nothing in this graph needs a postinstall build.
 RUN yarn install --frozen-lockfile --ignore-scripts
 
-# Only the claims service source is needed to build it.
+# Sources needed to build claims: the shared lib + the service. claims imports
+# @ar.io/attestor-canonical, so its source must be present and built first.
+COPY packages/canonical ./packages/canonical
 COPY packages/claims ./packages/claims
-RUN yarn workspace @ar.io/claims build
+
+# Build the shared lib first (emits dist + .d.ts), then the service.
+RUN yarn workspace @ar.io/attestor-canonical build \
+ && yarn workspace @ar.io/claims build
 
 # Drop dev deps. Workspace symlinks are preserved.
 RUN yarn install --frozen-lockfile --production --ignore-scripts
@@ -35,6 +40,10 @@ WORKDIR /app
 
 COPY --from=builder --chown=app:app /app/node_modules ./node_modules
 COPY --from=builder --chown=app:app /app/package.json ./package.json
+# The workspace symlink node_modules/@ar.io/attestor-canonical resolves to
+# /app/packages/canonical, so its built dist + manifest must be present.
+COPY --from=builder --chown=app:app /app/packages/canonical/dist ./packages/canonical/dist
+COPY --from=builder --chown=app:app /app/packages/canonical/package.json ./packages/canonical/package.json
 COPY --from=builder --chown=app:app /app/packages/claims/dist ./packages/claims/dist
 COPY --from=builder --chown=app:app /app/packages/claims/migrations ./packages/claims/migrations
 COPY --from=builder --chown=app:app /app/packages/claims/package.json ./packages/claims/package.json
