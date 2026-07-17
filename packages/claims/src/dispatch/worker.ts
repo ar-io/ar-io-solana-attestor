@@ -52,12 +52,25 @@ import { Buffer } from "node:buffer";
 import type { Pool, PoolClient } from "pg";
 import { address, type Address, type IInstruction, type TransactionSigner } from "@solana/kit";
 
-import type { Config } from "../config.js";
+import type { AntDispatchMode, Config } from "../config.js";
 import { appendAudit } from "../api/audit.js";
 import { computeVaultSettlement, type VaultSettlement } from "../verify/vault-settlement.js";
-import type { ChainGateway, SignedDispatch } from "./chain.js";
+import type { ChainGateway } from "./chain.js";
 import { FloatManager } from "./float.js";
 import { assertSeparableRoles, type DispenserSigner, type SignerRegistry } from "./signer.js";
+import {
+  type AssetRow,
+  type ClaimRow,
+  clearDeadSignature as coreClearDeadSignature,
+  dispatchSignedTx as coreDispatchSignedTx,
+  finalizeConfirmed as coreFinalizeConfirmed,
+  loadAsset as coreLoadAsset,
+  loadClaim as coreLoadClaim,
+  markFailed as coreMarkFailed,
+  markNeedsOperator as coreMarkNeedsOperator,
+  routeToManualVaultDelivery as coreRouteToManualVaultDelivery,
+  routeToReview as coreRouteToReview,
+} from "./dispatch-core.js";
 import {
   claimMemoIx,
   createAtaIdempotentIx,
@@ -88,6 +101,16 @@ export interface DispatchWorkerDeps {
   arioCoreProgram?: Address;
   /** Gate ANT dispatch on operator approval (default true — NFT never auto-dispensed hot). */
   antRequiresApproval?: boolean;
+  /**
+   * ANT custody mode (B1). In `operator-wallet` the ANT authority lives in the
+   * operator's wallet and ANT claims are dispatched EXCLUSIVELY by ant-operator.ts;
+   * the automated worker must NOT process ANT claims (it would run its own #recover
+   * against them — clearing signatures, consuming the rebuild budget, scanning the
+   * wrong fee payer). When `operator-wallet`, ANT claims are excluded from the
+   * pickup queue and any claim reserved into an ANT batch is refused defensively.
+   * Default `cli-cold` (unchanged behavior — the break-glass runAntBatch path).
+   */
+  antDispatchMode?: AntDispatchMode;
   /** Include the `ar.io-claim:<id>` memo ix for traceability (default true). Set
    *  false on a cluster whose SPL Memo program isn't loaded — the memo is
    *  cosmetic and must never block a dispense. */
@@ -134,30 +157,6 @@ export interface DispatchResult {
   detail?: string;
 }
 
-interface ClaimRow {
-  claim_id: string;
-  asset_key: string;
-  claimant: string;
-  status: string;
-  settlement: string | null;
-  approved_at: Date | null;
-  dispatch_signature: string | null;
-  dispatch_blockhash: string | null;
-  dispatch_last_valid_bh: string | null;
-  settlement_amount: string | null;
-  tx_signatures: string[] | null;
-  dispatch_resign_count: number;
-}
-interface AssetRow {
-  asset_key: string;
-  asset_type: "ant" | "token" | "vault";
-  ant_mint: string | null;
-  amount: string | null;
-  vault_end_ts: string | null;
-  status: string;
-  recipient_id: string;
-}
-
 export class DispatchWorker {
   #d: DispatchWorkerDeps;
   constructor(deps: DispatchWorkerDeps) {
@@ -193,6 +192,20 @@ export class DispatchWorker {
   }
 
   async #eligibleClaimIds(): Promise<string[]> {
+    // B1: in operator-wallet mode, EXCLUDE ANT assets from the automated pickup
+    // queue — they are dispatched exclusively by the operator-wallet flow. Join
+    // assets and filter `asset_type <> 'ant'`. In cli-cold (default) the queue is
+    // unchanged (ANT claims still flow through the break-glass runAntBatch path).
+    if ((this.#d.antDispatchMode ?? "cli-cold") === "operator-wallet") {
+      const r = await this.#d.pool.query<{ claim_id: string }>(
+        `SELECT c.claim_id FROM claims c JOIN assets a ON a.asset_key = c.asset_key
+          WHERE a.asset_type <> 'ant'
+            AND (c.status IN ('verified', 'dispatching')
+                 OR (c.status = 'pending_review' AND c.approved_at IS NOT NULL))
+          ORDER BY c.verified_at NULLS FIRST, c.created_at`,
+      );
+      return r.rows.map((x) => x.claim_id);
+    }
     const r = await this.#d.pool.query<{ claim_id: string }>(
       `SELECT claim_id FROM claims
         WHERE status IN ('verified', 'dispatching')
@@ -217,6 +230,17 @@ export class DispatchWorker {
 
     if (snap.status === "confirmed") {
       return { claimId, assetKey: snap.asset_key, outcome: "already_confirmed", signature: snap.dispatch_signature ?? undefined };
+    }
+    // L1 + B1 (guard symmetry): a claim RESERVED into an operator-wallet ANT batch
+    // (`ant_batch_id` set) is owned by ant-operator.ts. The automated/cli-cold worker
+    // must NEVER dispatch it FRESH (with a server ANT key) NOR recover it — either
+    // would strand the operator's reservation. Refuse it here so BOTH the fresh
+    // (#dispatchFresh) and recovery (#recover) paths are covered, in ANY mode. (The
+    // in-tx FOR UPDATE re-check + one_live_claim_per_asset still make a double-send
+    // impossible even without this; this closes the reservation-stranding gap.)
+    if (snap.ant_batch_id) {
+      this.#log("processClaim: skipping operator-owned ANT claim (ant_batch_id set)", { claimId, antBatchId: snap.ant_batch_id });
+      return { claimId, assetKey: snap.asset_key, outcome: "skipped", detail: "operator-wallet ANT claim (owned by ant-operator)" };
     }
     // A recorded signature means a dispatch is (or was) in flight — recover it
     // before ever signing anything new. This is the "check for an existing
@@ -248,6 +272,10 @@ export class DispatchWorker {
     const r = await this.#d.pool.query<{ claim_id: string }>(
       `SELECT c.claim_id FROM claims c JOIN assets a ON a.asset_key = c.asset_key
         WHERE a.asset_type = 'ant'
+          -- B1: a claim reserved into an operator-wallet ANT batch is owned by the
+          -- operator flow; the cli-cold break-glass path must NOT grab it (the two
+          -- paths must never fight over a claim).
+          AND c.ant_batch_id IS NULL
           AND (c.status = 'dispatching'
                OR (c.status = 'pending_review' AND c.approved_at IS NOT NULL))
         ORDER BY c.approved_at NULLS FIRST, c.created_at`,
@@ -263,6 +291,15 @@ export class DispatchWorker {
   // RECOVERY — a `dispatching` claim with a persisted signature.
   // -------------------------------------------------------------------------
   async #recover(snap: ClaimRow, antSignerOverride?: DispenserSigner): Promise<DispatchResult> {
+    // DEFENSE (B1): a claim reserved into an operator-wallet ANT batch is owned by
+    // ant-operator.ts (its own recover uses the TREASURY fee-payer for the outflow
+    // scan and its own rebuild budget). The automated worker must NEVER recover it —
+    // doing so would clear its signature, consume the rebuild budget, strand the
+    // batch, and scan the WRONG fee payer. Leave it untouched.
+    if (snap.ant_batch_id) {
+      this.#log("recover: skipping operator-owned ANT claim (ant_batch_id set)", { claimId: snap.claim_id, antBatchId: snap.ant_batch_id });
+      return { claimId: snap.claim_id, assetKey: snap.asset_key, outcome: "skipped", detail: "operator-wallet ANT claim (owned by ant-operator)" };
+    }
     const sig = snap.dispatch_signature as string;
     const lastValid = BigInt(snap.dispatch_last_valid_bh ?? "0");
     const state = await this.#d.gateway.confirmSignature(sig, lastValid);
@@ -444,36 +481,13 @@ export class DispatchWorker {
   ): Promise<DispatchResult> {
     // 1. SIGN (network I/O for the blockhash) — no DB lock held.
     const signed = await this.#d.gateway.signTransaction(ixs, signer);
-
-    // 2. PERSIST the signature + flip verified/approved -> dispatching, in ONE
-    //    committed txn, re-checking the state under the claim row lock so a
-    //    concurrent completer/worker can't double-dispatch. If the state moved,
-    //    we ABORT and never broadcast our signed tx (it simply never lands).
-    const persisted = await this.#persistDispatching(claimId, asset.asset_key, signed, settlementAmount, settlementLabel);
-    if (!persisted) {
-      return { claimId, assetKey: asset.asset_key, outcome: "skipped", detail: "state changed before dispatch" };
-    }
-
-    // 3. BROADCAST (after the commit). Idempotent — same signature dedups.
-    try {
-      await this.#d.gateway.broadcast(signed.wireBase64);
-    } catch (e) {
-      // A broadcast error is not fatal: the sig is persisted; recovery re-checks
-      // it (it may still have landed, or will expire and re-sign).
-      this.#log("broadcast error (will recover)", { claimId, sig: signed.signature, err: (e as Error).message });
-    }
-
-    // 4. CONFIRM inline. A crash here is fine — recovery finalizes.
-    const state = await this.#d.gateway.confirmSignature(signed.signature, signed.lastValidBlockHeight);
-    if (state === "confirmed") {
-      await this.#finalizeConfirmed(claimId, signed.signature);
-      return { claimId, assetKey: asset.asset_key, outcome: "confirmed", signature: signed.signature };
-    }
-    if (state === "failed") {
-      await this.#markFailed(claimId, `on-chain tx ${signed.signature} failed`);
-      return { claimId, assetKey: asset.asset_key, outcome: "failed", signature: signed.signature };
-    }
-    return { claimId, assetKey: asset.asset_key, outcome: "awaiting_confirmation", signature: signed.signature };
+    // 2-4. PERSIST-before-broadcast -> broadcast -> confirm (shared exactly-once
+    //      core; identical to the operator-wallet ANT path). If the state moved
+    //      under the FOR UPDATE re-check, the signed tx is discarded, never sent.
+    const r = await coreDispatchSignedTx(this.#d.pool, this.#d.gateway, {
+      claimId, assetKey: asset.asset_key, signed, settlementAmount, settlementLabel, log: this.#d.log,
+    });
+    return { claimId, assetKey: asset.asset_key, outcome: r.outcome, signature: r.signature, detail: r.detail };
   }
 
   // -------------------------------------------------------------------------
@@ -502,282 +516,49 @@ export class DispatchWorker {
   }
 
   // -------------------------------------------------------------------------
-  // DB state transitions (each its own committed txn; re-check under lock)
+  // DB state transitions — delegate to the shared exactly-once core so the
+  // operator-wallet ANT path (ant-operator.ts) reuses the SAME guard. Behavior
+  // is byte-identical to the pre-refactor private methods.
   // -------------------------------------------------------------------------
-  /** verified/approved-pending_review -> dispatching, persisting the signature. */
-  async #persistDispatching(
-    claimId: string,
-    assetKey: string,
-    signed: SignedDispatch,
-    settlementAmount: bigint | null,
-    settlementLabel?: string,
-  ): Promise<boolean> {
-    const client = await this.#d.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const c = await this.#loadClaim(client, claimId, true);
-      if (!c) {
-        await client.query("ROLLBACK");
-        return false;
-      }
-      const canDispatch = c.status === "verified" || (c.status === "pending_review" && c.approved_at);
-      if (!canDispatch) {
-        await client.query("ROLLBACK");
-        return false;
-      }
-      // AUTHORITATIVE double-send guard (worker's own, not relying on M3's locks):
-      // re-load the ASSET `FOR UPDATE` in this same txn and ABORT unless it is
-      // still dispatch-eligible (`claiming` | `pending_review`). If it already
-      // moved to `claimed` (or was cancelled/frozen), the signed tx is DISCARDED
-      // and NEVER broadcast — no second on-chain transfer can occur. Lock order
-      // is claim-row-then-asset-row (== service.ts completeClaim), so no deadlock.
-      const a = await this.#loadAsset(client, assetKey, true);
-      if (!a || (a.status !== "claiming" && a.status !== "pending_review")) {
-        await client.query("ROLLBACK");
-        this.#log("persistDispatching: ABORT — asset not dispatch-eligible", {
-          claimId, assetKey, assetStatus: a?.status ?? "missing", deadSig: signed.signature,
-        });
-        return false;
-      }
-      await client.query(
-        `UPDATE claims
-            SET status = 'dispatching',
-                dispatch_signature = $2,
-                dispatch_blockhash = $3,
-                dispatch_last_valid_bh = $4,
-                dispatch_started_at = now(),
-                settlement_amount = $5,
-                settlement = COALESCE($6, settlement),
-                tx_signatures = array_append(COALESCE(tx_signatures, ARRAY[]::text[]), $2),
-                error = NULL,
-                updated_at = now()
-          WHERE claim_id = $1`,
-        [claimId, signed.signature, signed.blockhash, signed.lastValidBlockHeight.toString(),
-          settlementAmount === null ? null : settlementAmount.toString(), settlementLabel ?? null],
-      );
-      await client.query(
-        "UPDATE assets SET status = 'claiming', updated_at = now() WHERE asset_key = $1 AND status <> 'claimed'",
-        [assetKey],
-      );
-      await appendAudit(client, {
-        event: "claim.dispatching", claimId, assetKey, status: "dispatching",
-        detail: { signature: signed.signature, blockhash: signed.blockhash, lastValidBlockHeight: signed.lastValidBlockHeight.toString(), settlement: settlementLabel, amount: settlementAmount?.toString() },
-      });
-      await client.query("COMMIT");
-      return true;
-    } catch (e) {
-      await client.query("ROLLBACK").catch(() => {});
-      throw e;
-    } finally {
-      client.release();
-    }
+  #finalizeConfirmed(claimId: string, signature: string): Promise<void> {
+    return coreFinalizeConfirmed(this.#d.pool, claimId, signature);
   }
 
-  /** dispatching -> confirmed; asset -> claimed (terminal). Idempotent. */
-  async #finalizeConfirmed(claimId: string, signature: string): Promise<void> {
-    const client = await this.#d.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const c = await this.#loadClaim(client, claimId, true);
-      if (!c) {
-        await client.query("ROLLBACK");
-        return;
-      }
-      if (c.status === "confirmed") {
-        await client.query("ROLLBACK");
-        return; // already finalized (idempotent)
-      }
-      await client.query(
-        `UPDATE claims
-            SET status = 'confirmed', confirmed_at = now(),
-                tx_signatures = CASE WHEN $2 = ANY(COALESCE(tx_signatures, ARRAY[]::text[]))
-                                     THEN tx_signatures
-                                     ELSE array_append(COALESCE(tx_signatures, ARRAY[]::text[]), $2) END,
-                error = NULL, updated_at = now()
-          WHERE claim_id = $1`,
-        [claimId, signature],
-      );
-      await client.query("UPDATE assets SET status = 'claimed', updated_at = now() WHERE asset_key = $1", [c.asset_key]);
-      await appendAudit(client, {
-        event: "claim.confirmed", claimId, assetKey: c.asset_key, status: "confirmed",
-        detail: { signature, settlementAmount: c.settlement_amount ?? undefined },
-      });
-      await client.query("COMMIT");
-    } catch (e) {
-      await client.query("ROLLBACK").catch(() => {});
-      throw e;
-    } finally {
-      client.release();
-    }
-  }
-
-  /** dispatching -> failed. Asset stays `claiming` for operator (no auto-retry). */
-  async #markFailed(claimId: string, reason: string): Promise<void> {
-    const client = await this.#d.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const c = await this.#loadClaim(client, claimId, true);
-      if (!c || c.status === "confirmed") {
-        await client.query("ROLLBACK");
-        return;
-      }
-      await client.query("UPDATE claims SET status = 'failed', error = $2, updated_at = now() WHERE claim_id = $1", [claimId, reason]);
-      await appendAudit(client, { event: "claim.failed", claimId, assetKey: c.asset_key, status: "failed", reason });
-      await client.query("COMMIT");
-    } catch (e) {
-      await client.query("ROLLBACK").catch(() => {});
-      throw e;
-    } finally {
-      client.release();
-    }
+  #markFailed(claimId: string, reason: string): Promise<void> {
+    return coreMarkFailed(this.#d.pool, claimId, reason);
   }
 
   /**
-   * Freeze a claim `needs_operator` (terminal-until-operator). Used when the
-   * re-sign cap is exceeded (adversarial item A): the claim is NEVER auto-retried
-   * — an operator must verify on-chain and re-drive. Asset stays `claiming` (not
-   * released), so no other claim can win it. Fires a critical alert.
+   * Freeze a claim `needs_operator` (terminal-until-operator) + fire the critical
+   * alert. The DB flip is the shared core; the alert stays worker-local.
    */
   async #markNeedsOperator(claimId: string, reason: string): Promise<void> {
-    const client = await this.#d.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const c = await this.#loadClaim(client, claimId, true);
-      if (!c || c.status === "confirmed" || c.status === "needs_operator") {
-        await client.query("ROLLBACK");
-        return;
-      }
-      await client.query("UPDATE claims SET status = 'needs_operator', error = $2, updated_at = now() WHERE claim_id = $1", [claimId, reason]);
-      await appendAudit(client, { event: "claim.needs_operator", claimId, assetKey: c.asset_key, status: "needs_operator", reason, detail: { severity: "critical", deadSignature: c.dispatch_signature ?? undefined } });
-      await client.query("COMMIT");
-    } catch (e) {
-      await client.query("ROLLBACK").catch(() => {});
-      throw e;
-    } finally {
-      client.release();
-    }
+    const flipped = await coreMarkNeedsOperator(this.#d.pool, claimId, reason);
+    if (!flipped) return;
     this.#log("CRITICAL: claim frozen needs_operator", { claimId, reason });
     this.#d.alert?.({ name: "dispatch-needs-operator", severity: "critical", message: reason, claimId });
   }
 
-  /**
-   * Route a still-locked vault claim to the MANUAL-delivery operator queue (V):
-   * the operator hand-delivers a "transfer tokens locked" to the correct absolute
-   * unlock timestamp (== the escrow's original vault_end_timestamp), NOT an auto
-   * CPI and NOT an infinite `pending_review` loop. The precise per-vault delivery
-   * instructions (claimant, amount, absolute unlock, or deliver-liquid if already
-   * unlocked) are produced by `vaultManualDeliveryQueue` from the asset's
-   * `vault_end_ts`. Asset stays `pending_review` so no other claim can win it.
-   */
-  async #routeToManualVaultDelivery(claimId: string, assetKey: string, unlockTs: bigint, lockDurationSeconds: bigint): Promise<void> {
-    const client = await this.#d.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const c = await this.#loadClaim(client, claimId, true);
-      if (!c || c.status === "confirmed" || c.status === "dispatching") {
-        await client.query("ROLLBACK");
-        return;
-      }
-      await client.query(
-        "UPDATE claims SET status = 'awaiting_manual_vault_delivery', settlement = 'manual_vault_relock', updated_at = now() WHERE claim_id = $1",
-        [claimId],
-      );
-      await client.query(
-        "UPDATE assets SET status = 'pending_review', updated_at = now() WHERE asset_key = $1 AND status NOT IN ('claimed')",
-        [assetKey],
-      );
-      await appendAudit(client, {
-        event: "claim.awaiting_manual_vault_delivery", claimId, assetKey, status: "awaiting_manual_vault_delivery",
-        detail: { unlockTimestamp: unlockTs.toString(), lockDurationSeconds: lockDurationSeconds.toString() },
-      });
-      await client.query("COMMIT");
-    } catch (e) {
-      await client.query("ROLLBACK").catch(() => {});
-      throw e;
-    } finally {
-      client.release();
-    }
+  #routeToManualVaultDelivery(claimId: string, assetKey: string, unlockTs: bigint, lockDurationSeconds: bigint): Promise<void> {
+    return coreRouteToManualVaultDelivery(this.#d.pool, claimId, assetKey, unlockTs, lockDurationSeconds);
   }
 
-  /** Clear a provably-dead (expired) signature so a fresh dispatch can re-sign. */
-  async #clearDeadSignature(claimId: string): Promise<void> {
-    const client = await this.#d.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const c = await this.#loadClaim(client, claimId, true);
-      if (!c || c.status !== "dispatching") {
-        await client.query("ROLLBACK");
-        return;
-      }
-      // Revert to `verified` (or pending_review if it was operator-approved) so
-      // #dispatchFresh re-signs. The dead sig stays in tx_signatures history.
-      // Bump dispatch_resign_count so the recovery path enforces the hard cap (A).
-      const revertTo = c.approved_at ? "pending_review" : "verified";
-      await client.query(
-        `UPDATE claims SET status = $2, dispatch_signature = NULL, dispatch_blockhash = NULL,
-             dispatch_last_valid_bh = NULL, dispatch_resign_count = dispatch_resign_count + 1,
-             updated_at = now() WHERE claim_id = $1`,
-        [claimId, revertTo],
-      );
-      await appendAudit(client, {
-        event: "claim.dispatch_expired", claimId, assetKey: c.asset_key, status: revertTo,
-        detail: { deadSignature: c.dispatch_signature ?? undefined },
-      });
-      await client.query("COMMIT");
-    } catch (e) {
-      await client.query("ROLLBACK").catch(() => {});
-      throw e;
-    } finally {
-      client.release();
-    }
+  #clearDeadSignature(claimId: string): Promise<void> {
+    return coreClearDeadSignature(this.#d.pool, claimId);
   }
 
-  /** verified/pending -> pending_review + asset pending_review (brake / ANT gate). */
-  async #routeToReview(claimId: string, assetKey: string, reason: string): Promise<void> {
-    const client = await this.#d.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const c = await this.#loadClaim(client, claimId, true);
-      if (!c || c.status === "confirmed" || c.status === "dispatching") {
-        await client.query("ROLLBACK");
-        return;
-      }
-      await client.query("UPDATE claims SET status = 'pending_review', updated_at = now() WHERE claim_id = $1", [claimId]);
-      await client.query(
-        "UPDATE assets SET status = 'pending_review', updated_at = now() WHERE asset_key = $1 AND status NOT IN ('claimed')",
-        [assetKey],
-      );
-      await appendAudit(client, { event: "claim.pending_review", claimId, assetKey, status: "pending_review", reason });
-      await client.query("COMMIT");
-    } catch (e) {
-      await client.query("ROLLBACK").catch(() => {});
-      throw e;
-    } finally {
-      client.release();
-    }
+  #routeToReview(claimId: string, assetKey: string, reason: string): Promise<void> {
+    return coreRouteToReview(this.#d.pool, claimId, assetKey, reason);
   }
 
   // -------------------------------------------------------------------------
-  // Loaders
+  // Loaders (delegate to the shared core loaders)
   // -------------------------------------------------------------------------
-  async #loadClaim(db: Pool | PoolClient, claimId: string, forUpdate = false): Promise<ClaimRow | null> {
-    const r = await db.query<ClaimRow>(
-      `SELECT claim_id, asset_key, claimant, status, settlement, approved_at,
-              dispatch_signature, dispatch_blockhash, dispatch_last_valid_bh::text AS dispatch_last_valid_bh,
-              settlement_amount::text AS settlement_amount, tx_signatures,
-              dispatch_resign_count
-         FROM claims WHERE claim_id = $1${forUpdate ? " FOR UPDATE" : ""}`,
-      [claimId],
-    );
-    return r.rows[0] ?? null;
+  #loadClaim(db: Pool | PoolClient, claimId: string, forUpdate = false): Promise<ClaimRow | null> {
+    return coreLoadClaim(db, claimId, forUpdate);
   }
-  async #loadAsset(db: Pool | PoolClient, assetKey: string, forUpdate = false): Promise<AssetRow | null> {
-    const r = await db.query<AssetRow>(
-      `SELECT asset_key, asset_type, ant_mint, amount::text AS amount, vault_end_ts::text AS vault_end_ts, status, recipient_id
-         FROM assets WHERE asset_key = $1${forUpdate ? " FOR UPDATE" : ""}`,
-      [assetKey],
-    );
-    return r.rows[0] ?? null;
+  #loadAsset(db: Pool | PoolClient, assetKey: string, forUpdate = false): Promise<AssetRow | null> {
+    return coreLoadAsset(db, assetKey, forUpdate);
   }
 
   /** Approve a claim (operator): sets approved_at so the worker will dispatch it. */

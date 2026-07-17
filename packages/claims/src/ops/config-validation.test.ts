@@ -165,3 +165,39 @@ describe("validateBootConfig — documented misconfigs fail fast", () => {
     assert.ok(r.errors.some((e) => e.code === "KEY_ADDRESS_INVALID"));
   });
 });
+
+describe("validateBootConfig — ANT_DISPATCH_MODE (operator wallet-signed)", () => {
+  it("defaults to cli-cold: no new errors when ANT_DISPATCH_MODE is unset", () => {
+    const r = validateBootConfig(goodWorkerEnv(), { role: "worker" });
+    assert.equal(r.errors.some((e) => e.code.startsWith("ANT_")), false, JSON.stringify(r.errors));
+  });
+
+  it("operator-wallet REFUSES a persistent server ANT key (sealed, seed, or cli keypair)", () => {
+    for (const k of ["ANT_SIGNER_KEY_SEALED_PATH", "ANT_SIGNER_SEED_BASE64", "ANT_COLD_KEY_SEALED_PATH", "ANT_COLD_KEYPAIR_PATH"]) {
+      const r = validateBootConfig({ ...goodWorkerEnv(), ANT_DISPATCH_MODE: "operator-wallet", [k]: "/some/value" }, { role: "worker" });
+      assert.ok(r.errors.some((e) => e.code === "ANT_OPERATOR_MODE_SERVER_KEY"), `expected refusal for ${k}`);
+    }
+  });
+
+  it("operator-wallet requires ANT_COLD_ADDRESS", () => {
+    const env: NodeJS.ProcessEnv = { ...goodWorkerEnv(), ANT_DISPATCH_MODE: "operator-wallet" };
+    delete env.ANT_COLD_ADDRESS;
+    const r = validateBootConfig(env, { role: "worker" });
+    assert.ok(r.errors.some((e) => e.code === "ANT_COLD_ADDRESS_MISSING"));
+  });
+
+  it("operator-wallet with ANT_COLD_ADDRESS and no server ANT key is clean", () => {
+    const r = validateBootConfig({ ...goodWorkerEnv(), ANT_DISPATCH_MODE: "operator-wallet" }, { role: "worker" });
+    assert.equal(r.ok, true, JSON.stringify(r.errors));
+  });
+
+  it("cli-cold (default) still ALLOWS a cold ANT keypair path (break-glass)", () => {
+    const r = validateBootConfig({ ...goodWorkerEnv(), ANT_DISPATCH_MODE: "cli-cold", ANT_COLD_KEYPAIR_PATH: "/run/cold.json" }, { role: "worker" });
+    assert.equal(r.errors.some((e) => e.code === "ANT_OPERATOR_MODE_SERVER_KEY"), false);
+  });
+
+  it("an invalid ANT_DISPATCH_MODE is rejected", () => {
+    const r = validateBootConfig({ ...goodWorkerEnv(), ANT_DISPATCH_MODE: "wat" }, { role: "worker" });
+    assert.ok(r.errors.some((e) => e.code === "ANT_DISPATCH_MODE_INVALID"));
+  });
+});
