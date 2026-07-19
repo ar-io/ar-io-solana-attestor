@@ -24,6 +24,30 @@ const config: Config = loadConfig();
 const log = pino({ level: config.logLevel });
 
 const app: Express = express();
+
+// CORS (opt-in via CORS_ALLOWED_ORIGINS; see config.ts). Hand-rolled —
+// exact-match allowlist only, no wildcard, no credentials. Sits BEFORE
+// the rate limiter so browser preflights don't consume per-IP budget.
+// With the env unset this middleware emits nothing, preserving the
+// production behavior where the fronting gateway owns CORS.
+if (config.corsAllowedOrigins.length > 0) {
+  app.use((req: Request, res: Response, next) => {
+    const origin = req.headers.origin;
+    if (origin && config.corsAllowedOrigins.includes(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+      if (req.method === "OPTIONS") {
+        res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+        res.setHeader("Access-Control-Max-Age", "86400");
+        res.status(204).end();
+        return;
+      }
+    }
+    next();
+  });
+}
+
 app.use(express.json({ limit: "16kb" }));
 app.use(
   rateLimit({

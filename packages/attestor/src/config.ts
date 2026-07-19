@@ -26,6 +26,8 @@ export interface Config {
   maxConcurrentVerifies: number;
   network: string;
   attestor: AttestorKeypair;
+  /** Exact origins allowed via CORS; empty = emit no CORS headers. */
+  corsAllowedOrigins: string[];
 }
 
 export function loadConfig(): Config {
@@ -54,6 +56,10 @@ export function loadConfig(): Config {
     maxConcurrentVerifies: parseInt(process.env.MAX_CONCURRENT_VERIFIES ?? "10", 10),
     network,
     attestor,
+    corsAllowedOrigins: (process.env.CORS_ALLOWED_ORIGINS ?? "")
+      .split(",")
+      .map((o) => o.trim())
+      .filter((o) => o.length > 0),
   };
 }
 
