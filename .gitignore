@@ -8,3 +8,6 @@ dist/
 
 # Workspace build output (redundant with dist/ above, kept explicit).
 packages/*/dist/
+
+# staging/rehearsal run artifacts (outputs, not source)
+packages/claims/scripts/rehearsal-out/
