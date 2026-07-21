@@ -74,6 +74,7 @@ interface AssetRow {
   asset_key: string;
   asset_type: AssetType;
   ant_mint: string | null;
+  ant_name: string | null;
   amount: string | null;
   vault_end_ts: string | null;
   nonce: Buffer;
@@ -114,6 +115,8 @@ export interface ClaimableAssetView {
   assetKey: string;
   assetType: AssetType;
   antMint: string | null;
+  /** ANT's on-chain ArNS name (MPL Core `name`); null for token/vault or un-backfilled ANTs. Display-only. */
+  name: string | null;
   amount: string | null; // mARIO decimal string; null for ANTs
   vaultEndTimestamp: number | null;
   nonceHex: string; // asset's stored nonce (informational; the binding nonce is issued by initiate)
@@ -291,7 +294,7 @@ export async function getClaimable(
 
   // available ONLY — manual_review / AT-RISK assets are excluded entirely.
   const a = await pool.query<AssetRow>(
-    `SELECT asset_key, asset_type, ant_mint, amount, vault_end_ts, nonce, status, recipient_id
+    `SELECT asset_key, asset_type, ant_mint, ant_name, amount, vault_end_ts, nonce, status, recipient_id
        FROM assets WHERE recipient_id = $1 AND status = 'available'
        ORDER BY asset_key`,
     [recip.recipient_id],
@@ -304,6 +307,7 @@ export async function getClaimable(
       assetKey: row.asset_key,
       assetType: row.asset_type,
       antMint: row.ant_mint,
+      name: row.asset_type === "ant" ? row.ant_name : null,
       amount: row.amount,
       vaultEndTimestamp: row.vault_end_ts === null ? null : Number(row.vault_end_ts),
       nonceHex: row.nonce.toString("hex"),
@@ -315,7 +319,7 @@ export async function getClaimable(
 /** GET /v1/assets/{assetKey} — single asset (manual_review hidden as 404). */
 export async function getAsset(pool: Pool, assetKey: string): Promise<ClaimableAssetView> {
   const a = await pool.query<AssetRow>(
-    `SELECT asset_key, asset_type, ant_mint, amount, vault_end_ts, nonce, status, recipient_id
+    `SELECT asset_key, asset_type, ant_mint, ant_name, amount, vault_end_ts, nonce, status, recipient_id
        FROM assets WHERE asset_key = $1`,
     [assetKey],
   );
@@ -327,6 +331,7 @@ export async function getAsset(pool: Pool, assetKey: string): Promise<ClaimableA
     assetKey: row.asset_key,
     assetType: row.asset_type,
     antMint: row.ant_mint,
+    name: row.asset_type === "ant" ? row.ant_name : null,
     amount: row.amount,
     vaultEndTimestamp: row.vault_end_ts === null ? null : Number(row.vault_end_ts),
     nonceHex: row.nonce.toString("hex"),

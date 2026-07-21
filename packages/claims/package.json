@@ -27,6 +27,7 @@
     "reconcile:dispatch": "tsx src/cli/reconcile-dispatch.ts",
     "vault:manual-queue": "tsx src/cli/vault-manual-queue.ts",
     "reap:challenges": "tsx src/cli/reap-challenges.ts",
+    "backfill:ant-names": "tsx src/cli/backfill-ant-names.ts",
     "publish:ledger": "tsx src/cli/publish-ledger.ts",
     "anchor:audit-log": "tsx src/cli/anchor-audit-log.ts",
     "verify:transparency": "tsx src/cli/verify-transparency.ts",

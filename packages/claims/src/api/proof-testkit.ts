@@ -78,6 +78,7 @@ export interface SeedAsset {
   assetKey: string;
   assetType: "ant" | "token" | "vault";
   antMint?: string | null;
+  antName?: string | null;
   amount?: bigint | null;
   vaultEndTs?: number | null;
   status?: string;
@@ -101,14 +102,15 @@ export async function insertAsset(
   a: SeedAsset,
 ): Promise<void> {
   await pool.query(
-    `INSERT INTO assets (asset_key, asset_type, recipient_id, ant_mint, amount, vault_end_ts, nonce, status, source)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
-     ON CONFLICT (asset_key) DO UPDATE SET status = EXCLUDED.status, amount = EXCLUDED.amount`,
+    `INSERT INTO assets (asset_key, asset_type, recipient_id, ant_mint, ant_name, amount, vault_end_ts, nonce, status, source)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
+     ON CONFLICT (asset_key) DO UPDATE SET status = EXCLUDED.status, amount = EXCLUDED.amount, ant_name = EXCLUDED.ant_name`,
     [
       a.assetKey,
       a.assetType,
       recipientId,
       a.antMint ?? null,
+      a.antName ?? null,
       a.amount === undefined || a.amount === null ? null : a.amount.toString(),
       a.vaultEndTs ?? null,
       randomBytes(32),
