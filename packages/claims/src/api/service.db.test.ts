@@ -23,7 +23,7 @@ import {
   signEthCanonical,
 } from "./proof-testkit.js";
 import { ApiError } from "./errors.js";
-import { completeClaim, getClaim, getClaimable, initiateClaim } from "./service.js";
+import { completeClaim, getAsset, getClaim, getClaimable, initiateClaim } from "./service.js";
 
 const HAS_DB = !!process.env.DATABASE_URL;
 
@@ -504,5 +504,38 @@ describe("claims API — state machine + concurrency", { skip: HAS_DB ? false : 
       (e: unknown) => e instanceof ApiError && e.status === 404 && e.code === "ASSET_NOT_FOUND",
       "manual_review must be indistinguishable from a nonexistent asset",
     );
+  });
+
+  it("ANT ArNS name (ant_name) surfaces in getClaimable + getAsset; token has null name", async (t) => {
+    if (!usable) return t.skip("M3 schema not migrated");
+    const id = makeArIdentity();
+    const antKey = "AntNameMint" + uid();
+    const tokKey = tokenKey("t" + uid());
+    track(id.recipientId, antKey, tokKey);
+    await insertRecipient(db.pool, { recipientId: id.recipientId, protocol: 0, sourceAddress: id.recipientId, recipientPubkey: id.modulus });
+    await insertAsset(db.pool, id.recipientId, { assetKey: antKey, assetType: "ant", antMint: antKey, antName: "wolfethyst" });
+    await insertAsset(db.pool, id.recipientId, { assetKey: tokKey, assetType: "token", amount: 5n });
+
+    const claimable = await getClaimable(db.pool, { recipientId: id.recipientId });
+    const antView = claimable.assets.find((a) => a.assetKey === antKey);
+    const tokView = claimable.assets.find((a) => a.assetKey === tokKey);
+    assert.equal(antView?.name, "wolfethyst", "ANT view exposes its on-chain name");
+    assert.equal(tokView?.name, null, "token view carries a null name");
+
+    // Single-asset endpoint mirrors the list.
+    assert.equal((await getAsset(db.pool, antKey)).name, "wolfethyst");
+    assert.equal((await getAsset(db.pool, tokKey)).name, null);
+  });
+
+  it("an ANT with no backfilled name returns name: null (not undefined)", async (t) => {
+    if (!usable) return t.skip("M3 schema not migrated");
+    const id = makeArIdentity();
+    const antKey = "AntNoName" + uid();
+    track(id.recipientId, antKey);
+    await insertRecipient(db.pool, { recipientId: id.recipientId, protocol: 0, sourceAddress: id.recipientId, recipientPubkey: id.modulus });
+    await insertAsset(db.pool, id.recipientId, { assetKey: antKey, assetType: "ant", antMint: antKey });
+
+    const view = await getAsset(db.pool, antKey);
+    assert.equal(view.name, null);
   });
 });
