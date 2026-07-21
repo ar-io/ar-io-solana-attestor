@@ -80,6 +80,10 @@ interface AssetRow {
   nonce: Buffer;
   status: string;
   recipient_id: string;
+  // Present only on the claimable/getAsset lookups (LEFT JOIN LATERAL on the
+  // winning claim); null for available assets and money-path callers.
+  claim_status?: string | null;
+  claim_tx?: string | null;
 }
 interface RecipientRow {
   recipient_id: string;
@@ -120,7 +124,12 @@ export interface ClaimableAssetView {
   amount: string | null; // mARIO decimal string; null for ANTs
   vaultEndTimestamp: number | null;
   nonceHex: string; // asset's stored nonce (informational; the binding nonce is issued by initiate)
+  /** Asset lifecycle: `available` (self-serve) or `claimed` (history). */
   status: string;
+  /** For a `claimed` asset: the winning claim's status (e.g. `confirmed`); null otherwise. Display-only. */
+  claimStatus: string | null;
+  /** For a `claimed` asset: the on-chain dispatch tx signature (for an explorer link); null otherwise. Display-only. */
+  claimTx: string | null;
 }
 export interface ClaimableResult {
   recipientId: string;
@@ -264,9 +273,46 @@ function statusForStoredCode(code: string): number {
 // ---------------------------------------------------------------------------
 // getClaimable — read-only lookup by identity (excludes manual_review)
 // ---------------------------------------------------------------------------
+
+/** Map an asset row (optionally carrying the winning-claim join columns) to the public view. */
+function claimableViewFromRow(row: AssetRow): ClaimableAssetView {
+  return {
+    assetKey: row.asset_key,
+    assetType: row.asset_type,
+    antMint: row.ant_mint,
+    name: row.asset_type === "ant" ? row.ant_name : null,
+    amount: row.amount,
+    vaultEndTimestamp: row.vault_end_ts === null ? null : Number(row.vault_end_ts),
+    nonceHex: row.nonce.toString("hex"),
+    status: row.status,
+    claimStatus: row.claim_status ?? null,
+    claimTx: row.claim_tx ?? null,
+  };
+}
+
+// SELECT list + LEFT JOIN LATERAL that decorates each asset with its winning
+// claim's status + on-chain dispatch signature (for the "Claimed ✓ · View" UX).
+// The lateral binds ONLY for `claimed` assets (ON a.status = 'claimed'); for
+// available assets claim_status/claim_tx come back NULL. Read-only; no schema
+// change. `confirmed` is preferred, then the most recent live/terminal claim.
+const ASSET_CLAIM_SELECT = `a.asset_key, a.asset_type, a.ant_mint, a.ant_name, a.amount,
+       a.vault_end_ts, a.nonce, a.status, a.recipient_id,
+       c.claim_status, c.claim_tx
+  FROM assets a
+  LEFT JOIN LATERAL (
+    SELECT status AS claim_status,
+           COALESCE(dispatch_signature, tx_signatures[array_length(tx_signatures, 1)]) AS claim_tx
+      FROM claims
+     WHERE asset_key = a.asset_key
+       AND status IN ('confirmed', 'dispatching', 'verified', 'failed',
+                      'needs_operator', 'awaiting_manual_vault_delivery')
+     ORDER BY (status = 'confirmed') DESC, confirmed_at DESC NULLS LAST, verified_at DESC NULLS LAST
+     LIMIT 1
+  ) c ON a.status = 'claimed'`;
+
 export async function getClaimable(
   pool: Pool,
-  q: { protocol?: string; address?: string; recipientId?: string },
+  q: { protocol?: string; address?: string; recipientId?: string; includeClaimed?: string; all?: string },
 ): Promise<ClaimableResult> {
   let recip: RecipientRow | undefined;
   if (q.recipientId) {
@@ -292,51 +338,37 @@ export async function getClaimable(
     throw new ApiError(422, "PROTOCOL_MISMATCH", "protocol does not match the stored recipient");
   }
 
-  // available ONLY — manual_review / AT-RISK assets are excluded entirely.
+  // Default: available ONLY (manual_review / AT-RISK excluded entirely).
+  // ?includeClaimed=1 (or ?all=1) ALSO returns the recipient's `claimed` assets
+  // as history — backward compatible, additive, still never surfaces manual_review.
+  const includeClaimed =
+    q.includeClaimed === "1" || q.includeClaimed === "true" || q.all === "1" || q.all === "true";
+  const statuses = includeClaimed ? ["available", "claimed"] : ["available"];
   const a = await pool.query<AssetRow>(
-    `SELECT asset_key, asset_type, ant_mint, ant_name, amount, vault_end_ts, nonce, status, recipient_id
-       FROM assets WHERE recipient_id = $1 AND status = 'available'
-       ORDER BY asset_key`,
-    [recip.recipient_id],
+    `SELECT ${ASSET_CLAIM_SELECT}
+      WHERE a.recipient_id = $1 AND a.status = ANY($2::text[])
+      ORDER BY (a.status = 'available') DESC, a.asset_key`,
+    [recip.recipient_id, statuses],
   );
   return {
     recipientId: recip.recipient_id,
     protocol: protocolName(recip.protocol),
     sourceAddress: recip.source_address,
-    assets: a.rows.map((row) => ({
-      assetKey: row.asset_key,
-      assetType: row.asset_type,
-      antMint: row.ant_mint,
-      name: row.asset_type === "ant" ? row.ant_name : null,
-      amount: row.amount,
-      vaultEndTimestamp: row.vault_end_ts === null ? null : Number(row.vault_end_ts),
-      nonceHex: row.nonce.toString("hex"),
-      status: row.status,
-    })),
+    assets: a.rows.map(claimableViewFromRow),
   };
 }
 
 /** GET /v1/assets/{assetKey} — single asset (manual_review hidden as 404). */
 export async function getAsset(pool: Pool, assetKey: string): Promise<ClaimableAssetView> {
   const a = await pool.query<AssetRow>(
-    `SELECT asset_key, asset_type, ant_mint, ant_name, amount, vault_end_ts, nonce, status, recipient_id
-       FROM assets WHERE asset_key = $1`,
+    `SELECT ${ASSET_CLAIM_SELECT} WHERE a.asset_key = $1`,
     [assetKey],
   );
   const row = a.rows[0];
   if (!row || row.status === "manual_review") {
     throw new ApiError(404, "ASSET_NOT_FOUND", "no self-serve asset with that key");
   }
-  return {
-    assetKey: row.asset_key,
-    assetType: row.asset_type,
-    antMint: row.ant_mint,
-    name: row.asset_type === "ant" ? row.ant_name : null,
-    amount: row.amount,
-    vaultEndTimestamp: row.vault_end_ts === null ? null : Number(row.vault_end_ts),
-    nonceHex: row.nonce.toString("hex"),
-    status: row.status,
-  };
+  return claimableViewFromRow(row);
 }
 
 // ---------------------------------------------------------------------------

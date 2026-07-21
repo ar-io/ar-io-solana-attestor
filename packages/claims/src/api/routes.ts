@@ -140,7 +140,13 @@ export function registerClaimsRoutes(app: FastifyInstance, deps: ClaimsRoutesDep
   // GET /v1/claimable
   app.get("/v1/claimable", async (req, reply) => {
     try {
-      const q = req.query as { protocol?: string; address?: string; recipientId?: string };
+      const q = req.query as {
+        protocol?: string;
+        address?: string;
+        recipientId?: string;
+        includeClaimed?: string;
+        all?: string;
+      };
       enforceIdentity(limiters, q.recipientId || q.address || "unknown");
       const res = await getClaimable(pool, q);
       reply.send(res);

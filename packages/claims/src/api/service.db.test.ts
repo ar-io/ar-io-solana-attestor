@@ -538,4 +538,49 @@ describe("claims API — state machine + concurrency", { skip: HAS_DB ? false : 
     const view = await getAsset(db.pool, antKey);
     assert.equal(view.name, null);
   });
+
+  it("includeClaimed=1 returns claimed assets as history (status+claimTx); default stays available-only", async (t) => {
+    if (!usable) return t.skip("M3 schema not migrated");
+    const id = makeArIdentity();
+    const availKey = tokenKey("av" + uid());
+    const claimedKey = tokenKey("cl" + uid());
+    track(id.recipientId, availKey, claimedKey);
+    await insertRecipient(db.pool, { recipientId: id.recipientId, protocol: 0, sourceAddress: id.recipientId, recipientPubkey: id.modulus });
+    await insertAsset(db.pool, id.recipientId, { assetKey: availKey, assetType: "token", amount: 100n });
+    await insertAsset(db.pool, id.recipientId, { assetKey: claimedKey, assetType: "token", amount: 200n, status: "claimed" });
+
+    // A winning, confirmed claim for the claimed asset carrying an on-chain tx signature.
+    const sig = "TxSig" + uid();
+    await db.pool.query(
+      `INSERT INTO claims (asset_key, claimant, canonical_message, user_signature, status, dispatch_signature, tx_signatures, confirmed_at)
+       VALUES ($1, $2, $3, $4, 'confirmed', $5, ARRAY[$5]::text[], now())`,
+      [claimedKey, randomClaimant(), Buffer.from("x"), Buffer.from("y"), sig],
+    );
+
+    // Default: available-only, backward compatible.
+    const def = await getClaimable(db.pool, { recipientId: id.recipientId });
+    assert.deepEqual(def.assets.map((a) => a.assetKey).sort(), [availKey].sort());
+    assert.equal(def.assets[0].status, "available");
+    assert.equal(def.assets[0].claimStatus, null);
+    assert.equal(def.assets[0].claimTx, null);
+
+    // includeClaimed=1: both, with the claimed one decorated with its claim status + tx.
+    const all = await getClaimable(db.pool, { recipientId: id.recipientId, includeClaimed: "1" });
+    const keys = all.assets.map((a) => a.assetKey);
+    assert.ok(keys.includes(availKey) && keys.includes(claimedKey), "both assets present");
+    const availView = all.assets.find((a) => a.assetKey === availKey)!;
+    const claimedView = all.assets.find((a) => a.assetKey === claimedKey)!;
+    assert.equal(availView.status, "available");
+    assert.equal(availView.claimStatus, null);
+    assert.equal(availView.claimTx, null);
+    assert.equal(claimedView.status, "claimed");
+    assert.equal(claimedView.claimStatus, "confirmed");
+    assert.equal(claimedView.claimTx, sig);
+    // Available assets sort before claimed history.
+    assert.equal(all.assets[0].status, "available");
+
+    // ?all=1 is an accepted alias for includeClaimed.
+    const aliased = await getClaimable(db.pool, { recipientId: id.recipientId, all: "1" });
+    assert.ok(aliased.assets.some((a) => a.assetKey === claimedKey));
+  });
 });
