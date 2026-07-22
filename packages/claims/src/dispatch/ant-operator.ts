@@ -8,10 +8,20 @@
 //! That keeps the EXISTING exactly-once anchor (persist-signature-before-broadcast)
 //! unchanged; the only thing that moved off the server is the AUTHORITY signature.
 //!
-//!   buildAntBatch  — select eligible ANT claims, build 1 tx/claim
-//!                    ([TransferV1, UpdateV1, memo], feePayer=treasury), treasury
-//!                    co-signs (=> txid known now), reserve the claims into a batch
-//!                    (FOR UPDATE SKIP LOCKED). Returns partially-signed txs.
+//!   reserveAntBatch    — select eligible ANT claims and RESERVE them into a batch
+//!                        (FOR UPDATE SKIP LOCKED; set ant_batch_id + ant_reserved_at,
+//!                        NO txs / NO blockhash). Returns REVIEW items for the operator
+//!                        to inspect. No treasury signer needed — nothing is built yet.
+//!   buildReservedBatch — for an already-reserved batch, fetch a FRESH blockhash NOW
+//!                        and build 1 tx/claim ([TransferV1, UpdateV1, memo],
+//!                        feePayer=treasury), treasury co-signs (=> txid known now) and
+//!                        the wire is persisted. This is the "build-at-sign-time" step:
+//!                        the fresh blockhash's ~60-90s validity window opens only when
+//!                        the operator commits to sign, so review time never expires it.
+//!                        A FIRST build — never touches dispatch_resign_count.
+//!   releaseAntBatch    — explicit operator Cancel: free every not-yet-submitted claim
+//!                        reserved to a batch (revert to verified/pending_review, clear
+//!                        ant_reserved_*), mark the batch expired. Immediate, vs the TTL.
 //!   submitAntBatch — per operator-signed tx: assert the authority signature is
 //!                    present AND == ANT_COLD_ADDRESS, match it back to its
 //!                    reservation by txid, then run the SHARED persist-dispatching
@@ -67,6 +77,8 @@ export interface AntBatchItem {
   claimId: string;
   assetKey: string;
   antMint: string;
+  /** on-chain ArNS name (MPL Core `name`), for operator-facing display. */
+  antName: string | null;
   claimant: string;
   /** base64 wire tx: treasury-signed (fee-payer slot), authority slot EMPTY. */
   txBase64: string;
@@ -76,9 +88,35 @@ export interface AntBatchItem {
   lastValidBlockHeight: string;
 }
 
+/** A claim that was reserved to a batch but could NOT be built (no longer eligible —
+ *  e.g. its reservation was TTL-freed, or the asset/claim status moved). */
+export interface AntBatchSkipped {
+  claimId: string;
+  assetKey: string;
+  reason: string;
+}
+
 export interface AntBatchResult {
   batchId: string;
   items: AntBatchItem[];
+  /** claims reserved to this batch that were skipped at build time (reported, not built). */
+  skipped?: AntBatchSkipped[];
+}
+
+/** A single review row — what the operator inspects BEFORE committing to sign. No tx
+ *  bytes / blockhash exist yet (those are built only at sign time). */
+export interface AntReviewItem {
+  claimId: string;
+  assetKey: string;
+  antMint: string;
+  /** on-chain ArNS name (MPL Core `name`), for operator-facing display. */
+  antName: string | null;
+  claimant: string;
+}
+
+export interface AntReserveResult {
+  batchId: string;
+  items: AntReviewItem[];
 }
 
 // ---------------------------------------------------------------------------
@@ -132,14 +170,15 @@ export async function buildAntTransferTx(treasury: TransactionSigner, args: Buil
 }
 
 // ---------------------------------------------------------------------------
-// buildAntBatch — select + reserve + build a batch of partially-signed txs.
+// reserveAntBatch — select + RESERVE eligible ANT claims (no txs, no blockhash).
+// This is the REVIEW step: the operator inspects the returned rows and, only when
+// they commit to sign, buildReservedBatch mints fresh txs. Splitting reserve from
+// build means review time never eats a blockhash's ~60-90s validity window.
 // ---------------------------------------------------------------------------
-export interface BuildAntBatchOpts {
+export interface ReserveAntBatchOpts {
   antColdAddress: Address;
-  /** max txs offered per session (ANT_BATCH_MAX). */
+  /** max claims offered per session (ANT_BATCH_MAX). */
   max: number;
-  /** include the `ar.io-claim:<id>` memo ix (default true). */
-  includeMemo?: boolean;
   /** reservation TTL (ms). Abandoned reservations older than this are freed first. */
   reservationTtlMs?: number;
   /** when true, only APPROVED pending_review ANT claims are eligible (default:
@@ -152,37 +191,28 @@ export interface BuildAntBatchOpts {
   log?: LogFn;
 }
 
-export async function buildAntBatch(
-  pool: Pool,
-  treasury: TransactionSigner,
-  gateway: AntChainGateway,
-  opts: BuildAntBatchOpts,
-): Promise<AntBatchResult> {
-  const includeMemo = opts.includeMemo ?? true;
+export async function reserveAntBatch(pool: Pool, opts: ReserveAntBatchOpts): Promise<AntReserveResult> {
   const ttlMs = opts.reservationTtlMs ?? 600_000;
   // Free abandoned reservations first so their claims are eligible again.
   await expireStaleReservations(pool, ttlMs);
 
-  // Fetch a fresh blockhash BEFORE opening the txn (no network I/O under lock).
-  const { blockhash, lastValidBlockHeight } = await gateway.latestBlockhash();
   const batchId = randomUUID();
-
   const statusPredicate = opts.requireApproval
     ? "(c.status = 'pending_review' AND c.approved_at IS NOT NULL)"
     : "(c.status = 'verified' OR (c.status = 'pending_review' AND c.approved_at IS NOT NULL))";
 
-  const items: AntBatchItem[] = [];
+  const items: AntReviewItem[] = [];
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     // Eligible ANT claims: asset is an ANT that is still dispatch-eligible
     // (`claiming` | `pending_review` — NEVER manual_review/AT-RISK, claimed,
     // cancelled or frozen), not already in flight (no dispatch_signature) and not
-    // reserved by a live batch. FOR UPDATE ... SKIP LOCKED so two concurrent build
+    // reserved by a live batch. FOR UPDATE ... SKIP LOCKED so two concurrent reserve
     // sessions never grab the same claim.
     const scope = opts.assetKeyScope ?? null;
-    const sel = await client.query<{ claim_id: string; claimant: string; asset_key: string; ant_mint: string | null }>(
-      `SELECT c.claim_id, c.claimant, c.asset_key, a.ant_mint
+    const sel = await client.query<{ claim_id: string; claimant: string; asset_key: string; ant_mint: string | null; ant_name: string | null }>(
+      `SELECT c.claim_id, c.claimant, c.asset_key, a.ant_mint, a.ant_name
          FROM claims c
          JOIN assets a ON a.asset_key = c.asset_key
         WHERE a.asset_type = 'ant'
@@ -198,7 +228,113 @@ export async function buildAntBatch(
     );
 
     for (const row of sel.rows) {
-      if (!row.ant_mint) continue; // an ANT with no mint can't be built; skip (stays eligible? no — skip and leave unreserved)
+      if (!row.ant_mint) continue; // an ANT with no mint can't be built; skip + leave unreserved.
+      // RESERVE only: mark the claim into the batch. ant_reserved_wire/blockhash/
+      // txid/last_valid_bh stay NULL — they are populated by buildReservedBatch when
+      // the operator commits, so the tx's freshness window opens at SIGN time.
+      await client.query(
+        `UPDATE claims
+            SET ant_batch_id = $2, ant_reserved_at = now(), updated_at = now()
+          WHERE claim_id = $1`,
+        [row.claim_id, batchId],
+      );
+      items.push({
+        claimId: row.claim_id,
+        assetKey: row.asset_key,
+        antMint: row.ant_mint,
+        antName: row.ant_name,
+        claimant: row.claimant,
+      });
+    }
+
+    await client.query(
+      `INSERT INTO ant_batches (batch_id, created_by_pubkey, claim_count, status)
+       VALUES ($1, $2, $3, 'open')`,
+      [batchId, opts.antColdAddress, items.length],
+    );
+    await appendAudit(client, {
+      event: "ant.batch.reserve",
+      status: "open",
+      detail: {
+        batchId,
+        createdBy: opts.antColdAddress,
+        claimCount: items.length,
+        claimIds: items.map((i) => i.claimId),
+      },
+    });
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+
+  opts.log?.("ant batch reserved", { batchId, claimCount: items.length });
+  return { batchId, items };
+}
+
+// ---------------------------------------------------------------------------
+// buildReservedBatch — build + treasury-cosign a FRESH tx for each claim reserved to
+// an already-open batch. Fetches the blockhash NOW (at sign time). A FIRST build:
+// never touches dispatch_resign_count / MAX_ANT_REBUILD_ATTEMPTS (those belong to the
+// provably-dead recovery path). Any reserved claim no longer eligible (its reservation
+// was TTL-freed, or its status/asset moved) is skipped + reported, never built.
+// ---------------------------------------------------------------------------
+export interface BuildReservedBatchOpts {
+  batchId: string;
+  antColdAddress: Address;
+  /** include the `ar.io-claim:<id>` memo ix (default true). */
+  includeMemo?: boolean;
+  log?: LogFn;
+}
+
+export async function buildReservedBatch(
+  pool: Pool,
+  treasury: TransactionSigner,
+  gateway: AntChainGateway,
+  opts: BuildReservedBatchOpts,
+): Promise<AntBatchResult> {
+  const includeMemo = opts.includeMemo ?? true;
+  // FRESH blockhash NOW — the whole point of the split. Fetched before the txn opens
+  // (no network I/O under lock).
+  const { blockhash, lastValidBlockHeight } = await gateway.latestBlockhash();
+
+  const items: AntBatchItem[] = [];
+  const skipped: AntBatchSkipped[] = [];
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    // Every claim still reserved to THIS batch that has not already dispatched. We
+    // re-derive eligibility in JS so an ineligible-but-reserved claim can be REPORTED
+    // (skipped) rather than silently dropped. FOR UPDATE OF c so a concurrent submit /
+    // recovery can't race the wire we are about to persist.
+    const sel = await client.query<{
+      claim_id: string; claimant: string; asset_key: string; claim_status: string; approved_at: Date | null;
+      ant_mint: string | null; ant_name: string | null; asset_type: string; asset_status: string;
+    }>(
+      `SELECT c.claim_id, c.claimant, c.asset_key, c.status AS claim_status, c.approved_at,
+              a.ant_mint, a.ant_name, a.asset_type, a.status AS asset_status
+         FROM claims c
+         JOIN assets a ON a.asset_key = c.asset_key
+        WHERE c.ant_batch_id = $1
+          AND c.dispatch_signature IS NULL
+        ORDER BY c.approved_at NULLS FIRST, c.created_at
+        FOR UPDATE OF c`,
+      [opts.batchId],
+    );
+
+    for (const row of sel.rows) {
+      const claimEligible = row.claim_status === "verified" || (row.claim_status === "pending_review" && row.approved_at !== null);
+      const assetEligible = row.asset_type === "ant" && (row.asset_status === "claiming" || row.asset_status === "pending_review");
+      if (!row.ant_mint) {
+        skipped.push({ claimId: row.claim_id, assetKey: row.asset_key, reason: "asset has no ant_mint" });
+        continue;
+      }
+      if (!claimEligible || !assetEligible) {
+        skipped.push({ claimId: row.claim_id, assetKey: row.asset_key, reason: `no longer eligible (claim=${row.claim_status}, asset=${row.asset_status})` });
+        continue;
+      }
       const built = await buildAntTransferTx(treasury, {
         claimId: row.claim_id,
         antMint: address(row.ant_mint),
@@ -210,17 +346,16 @@ export async function buildAntBatch(
       });
       await client.query(
         `UPDATE claims
-            SET ant_batch_id = $2, ant_reserved_at = now(),
-                ant_reserved_txid = $3, ant_reserved_blockhash = $4, ant_reserved_last_valid_bh = $5,
-                ant_reserved_wire = $6,
-                updated_at = now()
+            SET ant_reserved_txid = $2, ant_reserved_blockhash = $3, ant_reserved_last_valid_bh = $4,
+                ant_reserved_wire = $5, updated_at = now()
           WHERE claim_id = $1`,
-        [row.claim_id, batchId, built.txid, built.blockhash, built.lastValidBlockHeight.toString(), built.txBase64],
+        [row.claim_id, built.txid, built.blockhash, built.lastValidBlockHeight.toString(), built.txBase64],
       );
       items.push({
         claimId: row.claim_id,
         assetKey: row.asset_key,
         antMint: row.ant_mint,
+        antName: row.ant_name,
         claimant: row.claimant,
         txBase64: built.txBase64,
         txid: built.txid,
@@ -228,20 +363,16 @@ export async function buildAntBatch(
       });
     }
 
-    await client.query(
-      `INSERT INTO ant_batches (batch_id, created_by_pubkey, claim_count, status)
-       VALUES ($1, $2, $3, 'open')`,
-      [batchId, opts.antColdAddress, items.length],
-    );
     await appendAudit(client, {
       event: "ant.batch.build",
       status: "open",
       detail: {
-        batchId,
+        batchId: opts.batchId,
         createdBy: opts.antColdAddress,
         claimCount: items.length,
         claimIds: items.map((i) => i.claimId),
         txids: items.map((i) => i.txid),
+        skipped: skipped.map((s) => s.claimId),
       },
     });
     await client.query("COMMIT");
@@ -252,8 +383,55 @@ export async function buildAntBatch(
     client.release();
   }
 
-  opts.log?.("ant batch built", { batchId, claimCount: items.length });
-  return { batchId, items };
+  opts.log?.("ant batch built", { batchId: opts.batchId, claimCount: items.length, skipped: skipped.length });
+  return { batchId: opts.batchId, items, skipped };
+}
+
+// ---------------------------------------------------------------------------
+// releaseAntBatch — explicit operator Cancel. Free every claim reserved to a batch
+// that has NOT been submitted (no persisted dispatch_signature): revert its status,
+// clear all reservation fields + ant_batch_id, and mark the batch expired. Immediate,
+// unlike waiting out the reservation TTL. NEVER frees a submitted (dispatching) claim.
+// ---------------------------------------------------------------------------
+export async function releaseAntBatch(pool: Pool, batchId: string): Promise<{ batchId: string; freed: number }> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const freed = await client.query<{ claim_id: string }>(
+      `UPDATE claims
+          SET status = CASE WHEN approved_at IS NOT NULL THEN 'pending_review' ELSE 'verified' END,
+              ant_batch_id = NULL, ant_reserved_at = NULL, ant_reserved_txid = NULL,
+              ant_reserved_blockhash = NULL, ant_reserved_last_valid_bh = NULL,
+              ant_reserved_wire = NULL, updated_at = now()
+        WHERE ant_batch_id = $1
+          AND dispatch_signature IS NULL
+          AND status IN ('verified', 'pending_review')
+        RETURNING claim_id`,
+      [batchId],
+    );
+    // Mark the batch expired ONLY if no submitted (dispatching) claim still references
+    // it — a live dispatch keeps the header meaningful for finalizeBatchStatus.
+    await client.query(
+      `UPDATE ant_batches b
+          SET status = 'expired'
+        WHERE b.batch_id = $1
+          AND b.status IN ('open', 'submitted')
+          AND NOT EXISTS (SELECT 1 FROM claims c WHERE c.ant_batch_id = b.batch_id AND c.dispatch_signature IS NOT NULL)`,
+      [batchId],
+    );
+    await appendAudit(client, {
+      event: "ant.batch.cancel",
+      status: "expired",
+      detail: { batchId, freed: freed.rowCount ?? 0, claimIds: freed.rows.map((r) => r.claim_id) },
+    });
+    await client.query("COMMIT");
+    return { batchId, freed: freed.rowCount ?? 0 };
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -625,7 +803,7 @@ export interface AntPending {
   count: number;
   reserved: number;
   oldestAgeSeconds: number | null;
-  claims: { claimId: string; assetKey: string; antMint: string | null; status: string; reserved: boolean; ageSeconds: number }[];
+  claims: { claimId: string; assetKey: string; antMint: string | null; antName: string | null; status: string; reserved: boolean; ageSeconds: number }[];
 }
 
 /** Count + sample of ANT claims awaiting dispatch (verified / approved). */
@@ -633,8 +811,8 @@ export async function getAntPending(pool: Pool, opts: { requireApproval?: boolea
   const statusPredicate = opts.requireApproval
     ? "(c.status = 'pending_review' AND c.approved_at IS NOT NULL)"
     : "(c.status = 'verified' OR (c.status = 'pending_review' AND c.approved_at IS NOT NULL))";
-  const r = await pool.query<{ claim_id: string; asset_key: string; ant_mint: string | null; status: string; reserved: boolean; age: string }>(
-    `SELECT c.claim_id, c.asset_key, a.ant_mint, c.status,
+  const r = await pool.query<{ claim_id: string; asset_key: string; ant_mint: string | null; ant_name: string | null; status: string; reserved: boolean; age: string }>(
+    `SELECT c.claim_id, c.asset_key, a.ant_mint, a.ant_name, c.status,
             (c.ant_batch_id IS NOT NULL) AS reserved,
             EXTRACT(EPOCH FROM (now() - COALESCE(c.verified_at, c.created_at)))::bigint::text AS age
        FROM claims c JOIN assets a ON a.asset_key = c.asset_key
@@ -650,6 +828,7 @@ export async function getAntPending(pool: Pool, opts: { requireApproval?: boolea
     claimId: x.claim_id,
     assetKey: x.asset_key,
     antMint: x.ant_mint,
+    antName: x.ant_name,
     status: x.status,
     reserved: x.reserved,
     ageSeconds: Number(x.age),
@@ -669,7 +848,18 @@ export interface AntBatchStatus {
   createdAt: string;
   submittedAt: string | null;
   claimCount: number;
-  claims: { claimId: string; assetKey: string; status: string; dispatchSignature: string | null; reservedTxid: string | null }[];
+  claims: {
+    claimId: string;
+    assetKey: string;
+    status: string;
+    dispatchSignature: string | null;
+    reservedTxid: string | null;
+    /** ANT display + destination, so a completed batch's audit record can be re-pulled
+     *  from status alone (Refresh status) without keeping the build response around. */
+    antMint: string | null;
+    antName: string | null;
+    claimant: string;
+  }[];
 }
 
 /** Per-batch status for polling: header + per-claim state + signatures. */
@@ -682,10 +872,13 @@ export async function getAntBatchStatus(pool: Pool, batchId: string): Promise<An
   if (!hdr) return null;
   // Claims currently reserved to this batch, plus any that were reserved by it and
   // have since dispatched/confirmed (dispatch_signature carries the batch's txid or
-  // its confirmed successor). We report by the persisted reservation txid.
-  const c = await pool.query<{ claim_id: string; asset_key: string; status: string; dispatch_signature: string | null; ant_reserved_txid: string | null }>(
-    `SELECT claim_id, asset_key, status, dispatch_signature, ant_reserved_txid
-       FROM claims WHERE ant_batch_id = $1 ORDER BY claim_id`,
+  // its confirmed successor). We report by the persisted reservation txid, and join
+  // the asset for the ArNS name/mint + the claimant destination (audit re-pull).
+  const c = await pool.query<{ claim_id: string; asset_key: string; status: string; dispatch_signature: string | null; ant_reserved_txid: string | null; claimant: string; ant_mint: string | null; ant_name: string | null }>(
+    `SELECT c.claim_id, c.asset_key, c.status, c.dispatch_signature, c.ant_reserved_txid, c.claimant,
+            a.ant_mint, a.ant_name
+       FROM claims c JOIN assets a ON a.asset_key = c.asset_key
+      WHERE c.ant_batch_id = $1 ORDER BY c.claim_id`,
     [batchId],
   );
   return {
@@ -701,6 +894,9 @@ export async function getAntBatchStatus(pool: Pool, batchId: string): Promise<An
       status: x.status,
       dispatchSignature: x.dispatch_signature,
       reservedTxid: x.ant_reserved_txid,
+      antMint: x.ant_mint,
+      antName: x.ant_name,
+      claimant: x.claimant,
     })),
   };
 }
