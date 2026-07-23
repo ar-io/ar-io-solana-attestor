@@ -5,6 +5,7 @@
 //! bytes and filling the authority slot, never re-signing the fee payer.
 
 import { Buffer } from "node:buffer";
+import type { Pool } from "pg";
 import * as ed from "@noble/ed25519";
 import {
   createKeyPairSignerFromPrivateKeyBytes,
@@ -14,6 +15,14 @@ import {
   type Address,
   type TransactionSigner,
 } from "@solana/kit";
+
+import type { AntChainGateway } from "./chain.js";
+import {
+  buildReservedBatch,
+  reserveAntBatch,
+  type AntBatchResult,
+  type ReserveAntBatchOpts,
+} from "./ant-operator.js";
 
 export interface LocalAuthority {
   seed: Uint8Array;
@@ -60,4 +69,26 @@ export async function operatorSignAll(txsBase64: string[], authority: LocalAutho
 export async function signMessageBase64(message: Uint8Array, seed: Uint8Array): Promise<string> {
   const sig = await ed.signAsync(message, seed);
   return Buffer.from(sig).toString("base64");
+}
+
+/**
+ * TEST helper composing the production reserve -> build split into one call, matching
+ * the pre-split `buildAntBatch` signature so the exactly-once DB suites drive the FULL
+ * reserve+build path in one step. Reserves eligible claims, then immediately builds the
+ * fresh treasury-cosigned txs for that batch — returning the same `AntBatchResult` shape
+ * (items WITH txBase64/txid/lastValidBlockHeight) the routes expose after /build.
+ */
+export async function reserveAndBuild(
+  pool: Pool,
+  treasury: TransactionSigner,
+  gateway: AntChainGateway,
+  opts: ReserveAntBatchOpts & { includeMemo?: boolean },
+): Promise<AntBatchResult> {
+  const { batchId } = await reserveAntBatch(pool, opts);
+  return buildReservedBatch(pool, treasury, gateway, {
+    batchId,
+    antColdAddress: opts.antColdAddress,
+    includeMemo: opts.includeMemo,
+    log: opts.log,
+  });
 }

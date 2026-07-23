@@ -42,9 +42,11 @@ import { loadTransparencyConfig } from "../transparency/config.js";
 import { getMetricsPrometheus, getMetricsResult } from "./metrics.js";
 import { verifyAdminChallenge, type AntAdminContext } from "./ant-admin.js";
 import {
-  buildAntBatch,
+  buildReservedBatch,
   getAntBatchStatus,
   getAntPending,
+  releaseAntBatch,
+  reserveAntBatch,
   submitAntBatch,
 } from "../dispatch/ant-operator.js";
 
@@ -365,23 +367,58 @@ export function registerAntAdminRoutes(app: FastifyInstance, antAdmin?: AntAdmin
     }
   });
 
-  // POST /v1/admin/ant/batch — build + treasury-cosign a batch of partially-signed txs.
+  // POST /v1/admin/ant/batch — RESERVE eligible ANT claims for review (no txs built
+  // yet). Returns review items; the operator inspects them, then commits via /build.
   app.post("/v1/admin/ant/batch", async (req, reply) => {
     try {
       const ctx = requireAdmin();
       requireOperatorMode(ctx);
-      await verifyAdminChallenge(ctx.challengeStore, ctx.antColdAddress, readChallenge(req), "build");
+      await verifyAdminChallenge(ctx.challengeStore, ctx.antColdAddress, readChallenge(req), "reserve");
       const body = (req.body ?? {}) as { max?: number };
       const max = Math.min(body.max && body.max > 0 ? body.max : ctx.batchMax, ctx.batchMax);
-      const batch = await buildAntBatch(ctx.pool, ctx.treasurySigner, ctx.gateway, {
+      const batch = await reserveAntBatch(ctx.pool, {
         antColdAddress: ctx.antColdAddress,
         max,
-        includeMemo: ctx.includeMemo,
         reservationTtlMs: ctx.reservationTtlMs,
         requireApproval: ctx.requireApproval,
         log: ctx.log,
       });
       reply.code(201).send(batch);
+    } catch (e) {
+      sendApiError(reply, e);
+    }
+  });
+
+  // POST /v1/admin/ant/batch/:batchId/build — build FRESH treasury-cosigned txs for an
+  // already-reserved batch, the instant the operator commits to sign (fresh blockhash).
+  app.post("/v1/admin/ant/batch/:batchId/build", async (req, reply) => {
+    try {
+      const ctx = requireAdmin();
+      requireOperatorMode(ctx);
+      await verifyAdminChallenge(ctx.challengeStore, ctx.antColdAddress, readChallenge(req), "build");
+      const batchId = assertUuid((req.params as { batchId: string }).batchId);
+      const batch = await buildReservedBatch(ctx.pool, ctx.treasurySigner, ctx.gateway, {
+        batchId,
+        antColdAddress: ctx.antColdAddress,
+        includeMemo: ctx.includeMemo,
+        log: ctx.log,
+      });
+      reply.code(201).send(batch);
+    } catch (e) {
+      sendApiError(reply, e);
+    }
+  });
+
+  // POST /v1/admin/ant/batch/:batchId/cancel — explicit operator Cancel: release every
+  // not-yet-submitted claim reserved to the batch (immediate, vs the reservation TTL).
+  app.post("/v1/admin/ant/batch/:batchId/cancel", async (req, reply) => {
+    try {
+      const ctx = requireAdmin();
+      requireOperatorMode(ctx);
+      await verifyAdminChallenge(ctx.challengeStore, ctx.antColdAddress, readChallenge(req), "cancel");
+      const batchId = assertUuid((req.params as { batchId: string }).batchId);
+      const released = await releaseAntBatch(ctx.pool, batchId);
+      reply.send(released);
     } catch (e) {
       sendApiError(reply, e);
     }

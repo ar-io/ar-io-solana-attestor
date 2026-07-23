@@ -93,7 +93,7 @@ import {
   createAtaIdempotentIx,
   getAssociatedTokenAddress,
 } from "../src/dispatch/instructions.js";
-import { buildAntBatch, submitAntBatch } from "../src/dispatch/ant-operator.js";
+import { buildReservedBatch, reserveAntBatch, submitAntBatch } from "../src/dispatch/ant-operator.js";
 import {
   makeArIdentity,
   makeEthIdentity,
@@ -541,8 +541,11 @@ async function main(): Promise<void> {
 
   // BUILD: the TREASURY (hot dispenser) co-signs the fee-payer slot; the server learns
   // + persists the final txid BEFORE the operator ever co-signs. Scope to THIS asset.
-  const opBatch = await buildAntBatch(db.pool, hotKp, gateway, {
+  const reserved = await reserveAntBatch(db.pool, {
     antColdAddress: antAuthorityKp.address, max: 50, requireApproval: false, assetKeyScope: [opAntMint as string],
+  });
+  const opBatch = await buildReservedBatch(db.pool, hotKp, gateway, {
+    batchId: reserved.batchId, antColdAddress: antAuthorityKp.address, includeMemo: true,
   });
   const opItem = opBatch.items.find((i) => i.claimId === dOp.claimId);
 

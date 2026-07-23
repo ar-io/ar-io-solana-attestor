@@ -1,12 +1,13 @@
 //! TEST OPERATOR SIGNER — stands in for the operator's Phantom wallet in the
 //! wallet-signed ANT dispatch flow, until the real frontend admin panel exists.
-//! It drives the RUNNING ant-admin server (127.0.0.1:3051):
-//!   1. GET  /v1/admin/ant/challenge         -> nonce
-//!   2. sign `ar.io-ant-admin:build:<nonce>` with the ANT authority (ed25519)
-//!   3. POST /v1/admin/ant/batch             -> treasury-cosigned partial txs
-//!   4. co-sign each partial tx with the ANT authority (== Phantom signAllTransactions)
-//!   5. GET a fresh challenge, sign `submit:<nonce>`
-//!   6. POST /v1/admin/ant/batch/:id/submit  -> broadcast + confirm on devnet
+//! It drives the RUNNING ant-admin server (127.0.0.1:3051), build-at-sign-time flow:
+//!   1. GET  /v1/admin/ant/challenge, sign `reserve:<nonce>`
+//!   2. POST /v1/admin/ant/batch             -> RESERVE eligible claims (review items)
+//!   3. GET a fresh challenge, sign `build:<nonce>`
+//!   4. POST /v1/admin/ant/batch/:id/build   -> FRESH treasury-cosigned partial txs
+//!   5. co-sign each partial tx with the ANT authority (== Phantom signAllTransactions)
+//!   6. GET a fresh challenge, sign `submit:<nonce>`
+//!   7. POST /v1/admin/ant/batch/:id/submit  -> broadcast + confirm on devnet
 //! The ANT authority key signs LOCALLY here; the server never holds it. DEVNET ONLY.
 //! Exports `operatorSign()` for smoke-suite.ts; also a thin CLI.
 //!
@@ -55,14 +56,26 @@ export async function operatorSign(opts: {
     return { nonce, sig: Buffer.from(sig).toString("base64") };
   }
 
-  const buildCh = await signedChallenge("build");
-  const buildRes = await fetch(`${opts.adminUrl}/v1/admin/ant/batch`, {
+  // 1. RESERVE eligible claims (review step — no txs built yet).
+  const reserveCh = await signedChallenge("reserve");
+  const reserveRes = await fetch(`${opts.adminUrl}/v1/admin/ant/batch`, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ...buildCh, max: opts.max ?? 50 }),
+    body: JSON.stringify({ ...reserveCh, max: opts.max ?? 50 }),
+  });
+  if (reserveRes.status !== 201) throw new Error(`reserve ${reserveRes.status}: ${await reserveRes.text()}`);
+  const reserved = await reserveRes.json();
+  log(`reserved batch ${reserved.batchId} with ${reserved.items.length} claim(s) for review`);
+  if (reserved.items.length === 0) return { batchId: reserved.batchId, items: [], results: [] };
+
+  // 2. BUILD fresh treasury-cosigned txs for the reserved batch (fresh blockhash NOW).
+  const buildCh = await signedChallenge("build");
+  const buildRes = await fetch(`${opts.adminUrl}/v1/admin/ant/batch/${reserved.batchId}/build`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify(buildCh),
   });
   if (buildRes.status !== 201) throw new Error(`build ${buildRes.status}: ${await buildRes.text()}`);
   const batch = await buildRes.json();
-  log(`built batch ${batch.batchId} with ${batch.items.length} tx(s)`);
+  log(`built batch ${batch.batchId} with ${batch.items.length} tx(s)${batch.skipped?.length ? ` (${batch.skipped.length} skipped)` : ""}`);
   if (batch.items.length === 0) return { batchId: batch.batchId, items: [], results: [] };
 
   const b64enc = getBase64Encoder();

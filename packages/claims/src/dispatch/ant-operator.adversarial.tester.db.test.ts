@@ -25,13 +25,12 @@ import { createDb, type Db } from "../db.js";
 import { insertAsset, insertRecipient, randomClaimant } from "../api/proof-testkit.js";
 import { FakeChainGateway } from "./fake-chain.testkit.js";
 import {
-  buildAntBatch,
   buildAntTransferTx,
   expireStaleReservations,
   recoverReservedAntClaim,
   submitAntBatch,
 } from "./ant-operator.js";
-import { makeLocalAuthority, operatorSignAll, operatorSignTx, signTxAtSlot, type LocalAuthority } from "./ant-operator.testkit.js";
+import { makeLocalAuthority, operatorSignAll, operatorSignTx, reserveAndBuild, signTxAtSlot, type LocalAuthority } from "./ant-operator.testkit.js";
 
 const HAS_DB = !!process.env.DATABASE_URL;
 
@@ -113,7 +112,7 @@ describe("ant-operator ADVERSARIAL (tester)", { skip: !HAS_DB }, () => {
     const s = await seedClaim({ assetType: "ant" });
     const attacker = randomClaimant() as Address;
     const fake = new FakeChainGateway();
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
     const item = batch.items[0];
 
     // Attacker builds a REDIRECT tx (newOwner = attacker) with a fresh treasury sig
@@ -136,7 +135,7 @@ describe("ant-operator ADVERSARIAL (tester)", { skip: !HAS_DB }, () => {
     const s = await seedClaim({ assetType: "ant" });
     const attacker = randomClaimant() as Address;
     const fake = new FakeChainGateway();
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
     const item = batch.items[0];
 
     // Lift the treasury (fee-payer) signature bytes from the legit reserved tx.
@@ -173,7 +172,7 @@ describe("ant-operator ADVERSARIAL (tester)", { skip: !HAS_DB }, () => {
   it("S1c: CLOSED — memo-stripped tamper with copied txid is likewise REJECTED pre-broadcast (same message-binding fix)", async () => {
     const s = await seedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
     const item = batch.items[0];
     const legit = getTransactionDecoder().decode(new Uint8Array(getBase64Encoder().encode(item.txBase64)));
     const treasurySigBytes = (legit.signatures as Record<string, Uint8Array | null>)[treasury.address];
@@ -203,7 +202,7 @@ describe("ant-operator ADVERSARIAL (tester)", { skip: !HAS_DB }, () => {
   it("S2a: two CONCURRENT submits of the same signed batch -> at most ONE on-chain send", async () => {
     const s = await seedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
     const signed = await operatorSignAll(batch.items.map((i) => i.txBase64), antCold);
 
     const [a, b] = await Promise.all([
@@ -220,7 +219,7 @@ describe("ant-operator ADVERSARIAL (tester)", { skip: !HAS_DB }, () => {
   it("S2b: submit AFTER the batch already confirmed -> already_confirmed, no second send", async () => {
     const s = await seedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
     const signed = await operatorSignAll(batch.items.map((i) => i.txBase64), antCold);
     await submitAntBatch(db.pool, fake, submit(batch.batchId, signed));
     const again = await submitAntBatch(db.pool, fake, submit(batch.batchId, signed));
@@ -233,7 +232,7 @@ describe("ant-operator ADVERSARIAL (tester)", { skip: !HAS_DB }, () => {
     // this proves the persisted-txid anchor de-dups regardless of the submitted wire.
     const s = await seedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
     const signedA = await operatorSignTx(batch.items[0].txBase64, antCold);
     const signedB = await operatorSignTx(batch.items[0].txBase64, antCold);
     // Submit BOTH copies in ONE batch call.
@@ -251,7 +250,7 @@ describe("ant-operator ADVERSARIAL (tester)", { skip: !HAS_DB }, () => {
     const risk = await seedClaim({ assetType: "ant", assetStatus: "manual_review" });
     const ok = await seedClaim({ assetType: "ant" }); // an eligible one, same scope, to prove selection works
     const fake = new FakeChainGateway();
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [risk.assetKey, ok.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [risk.assetKey, ok.assetKey] });
     const ids = batch.items.map((i) => i.claimId);
     assert.ok(!ids.includes(risk.claimId), "manual_review ANT MUST NOT be in a batch");
     assert.ok(ids.includes(ok.claimId), "the eligible ANT still selected");
@@ -268,7 +267,7 @@ describe("ant-operator ADVERSARIAL (tester)", { skip: !HAS_DB }, () => {
     });
     // A real (empty) batch to submit against.
     const other = await seedClaim({ assetType: "ant" });
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [other.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [other.assetKey] });
     const signed = await operatorSignTx(built.txBase64, antCold);
     const res = await submitAntBatch(db.pool, fake, submit(batch.batchId, [signed]));
     assert.equal(res[0].outcome, "rejected_unknown_tx");
@@ -282,8 +281,8 @@ describe("ant-operator ADVERSARIAL (tester)", { skip: !HAS_DB }, () => {
     const s = await seedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
     const [b1, b2] = await Promise.all([
-      buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] }),
-      buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] }),
+      reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] }),
+      reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] }),
     ]);
     const inB1 = b1.items.some((i) => i.claimId === s.claimId);
     const inB2 = b2.items.some((i) => i.claimId === s.claimId);
@@ -296,7 +295,7 @@ describe("ant-operator ADVERSARIAL (tester)", { skip: !HAS_DB }, () => {
     const s = await seedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
     fake.dropBroadcast = true; // submitted, never lands
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
     const signed = await operatorSignAll(batch.items.map((i) => i.txBase64), antCold);
     await submitAntBatch(db.pool, fake, submit(batch.batchId, signed));
     assert.equal((await claimRow(s.claimId)).status, "dispatching");
@@ -309,7 +308,7 @@ describe("ant-operator ADVERSARIAL (tester)", { skip: !HAS_DB }, () => {
 
     // Re-build + submit again, drop again, expire again -> now the cap is hit and it
     // FREEZES needs_operator rather than re-sending forever.
-    const batch2 = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
+    const batch2 = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
     const signed2 = await operatorSignAll(batch2.items.map((i) => i.txBase64), antCold);
     await submitAntBatch(db.pool, fake, submit(batch2.batchId, signed2));
     fake.blockHeight += 1000n;
@@ -324,7 +323,7 @@ describe("ant-operator ADVERSARIAL (tester)", { skip: !HAS_DB }, () => {
   it("S5c: an abandoned (never-submitted) reservation frees the claim on TTL; nothing broadcast", async () => {
     const s = await seedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
     assert.equal((await claimRow(s.claimId)).batchId, batch.batchId);
     const freed = await expireStaleReservations(db.pool, 0);
     assert.ok(freed >= 1);
@@ -339,7 +338,7 @@ describe("ant-operator ADVERSARIAL (tester)", { skip: !HAS_DB }, () => {
     const s = await seedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
     fake.dropBroadcast = true;
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
     const signed = await operatorSignAll(batch.items.map((i) => i.txBase64), antCold);
     await submitAntBatch(db.pool, fake, submit(batch.batchId, signed));
     assert.equal((await claimRow(s.claimId)).status, "dispatching");
@@ -357,14 +356,14 @@ describe("ant-operator ADVERSARIAL (tester)", { skip: !HAS_DB }, () => {
     const s = await seedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
     fake.dropBroadcast = true;
-    const b1 = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
+    const b1 = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
     await submitAntBatch(db.pool, fake, submit(b1.batchId, await operatorSignAll(b1.items.map((i) => i.txBase64), antCold)));
     fake.blockHeight += 1000n;
     const rec = await recoverReservedAntClaim(db.pool, fake, treasuryAddress, s.claimId);
     assert.equal(rec.outcome, "released_for_rebuild");
 
     fake.dropBroadcast = false;
-    const b2 = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
+    const b2 = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
     assert.notEqual(b2.items[0].txid, b1.items[0].txid, "fresh blockhash => new txid");
     const res = await submitAntBatch(db.pool, fake, submit(b2.batchId, await operatorSignAll(b2.items.map((i) => i.txBase64), antCold)));
     assert.equal(res[0].outcome, "confirmed");
@@ -377,7 +376,7 @@ describe("ant-operator ADVERSARIAL (tester)", { skip: !HAS_DB }, () => {
   it("S8a: an ANT dispatch stores settlement_amount NULL (no mARIO) and never a coerced number", async () => {
     const s = await seedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
     await submitAntBatch(db.pool, fake, submit(batch.batchId, await operatorSignAll(batch.items.map((i) => i.txBase64), antCold)));
     const cr = await claimRow(s.claimId);
     assert.equal(cr.status, "confirmed");
@@ -390,7 +389,7 @@ describe("ant-operator ADVERSARIAL (tester)", { skip: !HAS_DB }, () => {
     // A block height that is NOT representable exactly as a JS number.
     fake.blockHeight = 9_007_199_254_740_993n; // 2^53 + 1
     const expectedLvbh = (fake.blockHeight + 150n).toString();
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [s.assetKey] });
     assert.equal(batch.items[0].lastValidBlockHeight, expectedLvbh, "batch item lvbh is the exact decimal string");
     await submitAntBatch(db.pool, fake, submit(batch.batchId, await operatorSignAll(batch.items.map((i) => i.txBase64), antCold)));
     const cr = await claimRow(s.claimId);

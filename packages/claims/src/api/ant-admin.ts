@@ -18,13 +18,15 @@ import type { AntDispatchMode } from "../config.js";
 import type { AntChainGateway } from "../dispatch/chain.js";
 import { ApiError } from "./errors.js";
 
-/** The admin actions a challenge signature may authorize (route-binding). */
-export type AdminAction = "session" | "build" | "submit";
+/** The admin actions a challenge signature may authorize (route-binding).
+ *  `reserve` = POST /batch (review), `build` = POST /batch/:id/build (fresh txs at
+ *  sign time), `submit` = POST /batch/:id/submit, `cancel` = POST /batch/:id/cancel. */
+export type AdminAction = "session" | "reserve" | "build" | "submit" | "cancel";
 
 /** The bytes the operator wallet signs. With an `action` the message is
  *  `ar.io-ant-admin:<action>:<nonce>` — binding the ACTION means a {nonce,sig}
- *  captured for one route can't be redirected to another (build↔submit) within the
- *  nonce TTL. Without one it is the legacy `ar.io-ant-admin:<nonce>`. */
+ *  captured for one route can't be redirected to another (reserve↔build↔submit↔cancel)
+ *  within the nonce TTL. Without one it is the legacy `ar.io-ant-admin:<nonce>`. */
 export const ADMIN_CHALLENGE_PREFIX = "ar.io-ant-admin:";
 
 export function adminChallengeMessage(nonce: string, action?: AdminAction): Uint8Array {

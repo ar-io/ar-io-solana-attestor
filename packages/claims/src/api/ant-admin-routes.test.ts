@@ -39,6 +39,14 @@ async function sessionToken(app: Awaited<ReturnType<typeof buildAntAdminApp>>): 
   return (res.json() as { readToken: string }).readToken;
 }
 
+/** A fresh {nonce,sig} authorizing a WRITE action (reserve/build/submit/cancel). */
+async function writeChallenge(app: Awaited<ReturnType<typeof buildAntAdminApp>>, action: "reserve" | "build" | "submit" | "cancel"): Promise<{ nonce: string; sig: string }> {
+  const ch = await app.inject({ method: "GET", url: "/v1/admin/ant/challenge" });
+  const { nonce } = ch.json() as { nonce: string };
+  const sig = await signMessageBase64(adminChallengeMessage(nonce, action), antCold.seed);
+  return { nonce, sig };
+}
+
 describe("ant-admin HTTP routes", { skip: !HAS_DB }, () => {
   before(async () => {
     db = createDb(process.env.DATABASE_URL as string);
@@ -51,7 +59,12 @@ describe("ant-admin HTTP routes", { skip: !HAS_DB }, () => {
       challengeStore: new AntChallengeStore(),
     };
   });
-  after(async () => { await db.close(); });
+  after(async () => {
+    // Housekeeping: drop any batch headers this suite's reserve/build created (their
+    // claims are already released by cancel; only the empty/expired headers linger).
+    await db.pool.query("DELETE FROM ant_batches WHERE created_by_pubkey = $1", [antCold.address]).catch(() => {});
+    await db.close();
+  });
 
   it("B2: CORS advertises x-ant-read-token on the preflight AND normal responses", async () => {
     const app = buildAntAdminApp(testConfig(), ctx);
@@ -93,6 +106,57 @@ describe("ant-admin HTTP routes", { skip: !HAS_DB }, () => {
     const sig = await signMessageBase64(adminChallengeMessage(nonce, "submit"), antCold.seed);
     const res = await app.inject({ method: "POST", url: "/v1/admin/ant/batch/nope/submit", payload: { nonce, sig, signedTxs: [] } });
     assert.equal(res.statusCode, 400);
+    await app.close();
+  });
+
+  it("build / cancel with a non-UUID batchId return 400 (after a valid action challenge)", async () => {
+    const app = buildAntAdminApp(testConfig(), ctx);
+    const buildRes = await app.inject({ method: "POST", url: "/v1/admin/ant/batch/nope/build", payload: await writeChallenge(app, "build") });
+    assert.equal(buildRes.statusCode, 400);
+    const cancelRes = await app.inject({ method: "POST", url: "/v1/admin/ant/batch/nope/cancel", payload: await writeChallenge(app, "cancel") });
+    assert.equal(cancelRes.statusCode, 400);
+    await app.close();
+  });
+
+  it("reserve -> build -> cancel round-trip (build-at-sign-time split)", async () => {
+    const app = buildAntAdminApp(testConfig(), ctx);
+    // RESERVE: 201 with a batchId + review items (an array; may be empty in the shared
+    // test DB). Whatever it grabs is released by the cancel below, so nothing strands.
+    const reserveRes = await app.inject({ method: "POST", url: "/v1/admin/ant/batch", payload: await writeChallenge(app, "reserve") });
+    assert.equal(reserveRes.statusCode, 201);
+    const reserved = reserveRes.json() as { batchId: string; items: unknown[] };
+    assert.ok(typeof reserved.batchId === "string" && Array.isArray(reserved.items));
+    // Review items carry NO tx bytes yet — the fresh txs are built only at /build.
+    for (const it of reserved.items as Record<string, unknown>[]) assert.equal(it.txBase64, undefined);
+
+    // BUILD: 201 with items carrying txBase64 (fresh blockhash). A "build" sig can't be
+    // a reserve sig (action-bound) — this proves the new action binding wires through.
+    const buildRes = await app.inject({ method: "POST", url: `/v1/admin/ant/batch/${reserved.batchId}/build`, payload: await writeChallenge(app, "build") });
+    assert.equal(buildRes.statusCode, 201);
+    const built = buildRes.json() as { batchId: string; items: { txBase64: string; txid: string }[] };
+    assert.equal(built.batchId, reserved.batchId);
+    assert.equal(built.items.length, reserved.items.length, "every reviewed claim builds a tx (none TTL-freed in-window)");
+    for (const it of built.items) assert.ok(typeof it.txBase64 === "string" && typeof it.txid === "string");
+
+    // CANCEL: releases every not-yet-submitted reserved claim, returns freed count.
+    const cancelRes = await app.inject({ method: "POST", url: `/v1/admin/ant/batch/${reserved.batchId}/cancel`, payload: await writeChallenge(app, "cancel") });
+    assert.equal(cancelRes.statusCode, 200);
+    const released = cancelRes.json() as { batchId: string; freed: number };
+    assert.equal(released.batchId, reserved.batchId);
+    assert.equal(released.freed, reserved.items.length, "cancel frees exactly what was reserved");
+    // The batch header is now expired; a status read reflects it.
+    const token = await sessionToken(app);
+    const st = await app.inject({ method: "GET", url: `/v1/admin/ant/batch/${reserved.batchId}`, headers: { "x-ant-read-token": token } });
+    assert.equal((st.json() as { status: string }).status, "expired");
+    await app.close();
+  });
+
+  it("a reserve challenge does NOT authorize submit (action binding for the new verbs)", async () => {
+    const app = buildAntAdminApp(testConfig(), ctx);
+    const reserveCh = await writeChallenge(app, "reserve");
+    // Present the reserve-bound {nonce,sig} to /build -> message mismatch -> 401.
+    const res = await app.inject({ method: "POST", url: `/v1/admin/ant/batch/${randomUUID()}/build`, payload: reserveCh });
+    assert.equal(res.statusCode, 401);
     await app.close();
   });
 

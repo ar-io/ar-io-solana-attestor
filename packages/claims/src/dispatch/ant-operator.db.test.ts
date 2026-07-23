@@ -1,5 +1,5 @@
 //! Operator wallet-signed ANT dispatch — DB-backed exactly-once (mirrors the
-//! worker.*.db.test.ts patterns). Drives buildAntBatch -> operator-sign (LOCAL
+//! worker.*.db.test.ts patterns). Drives reserve+build -> operator-sign (LOCAL
 //! keypair standing in for ANT_COLD_ADDRESS) -> submitAntBatch against a
 //! deterministic FakeChainGateway, and PROVES:
 //!   * happy path build->sign->submit->confirm (asset claimed, ONE transfer)
@@ -33,13 +33,12 @@ import { InMemoryKeypairSigner, type SignerRegistry } from "./signer.js";
 import { DispatchWorker } from "./worker.js";
 import { FakeChainGateway } from "./fake-chain.testkit.js";
 import {
-  buildAntBatch,
   buildAntTransferTx,
   expireStaleReservations,
   recoverReservedAntClaim,
   submitAntBatch,
 } from "./ant-operator.js";
-import { makeLocalAuthority, operatorSignAll, operatorSignTx, signTxAtSlot, type LocalAuthority } from "./ant-operator.testkit.js";
+import { makeLocalAuthority, operatorSignAll, operatorSignTx, reserveAndBuild, signTxAtSlot, type LocalAuthority } from "./ant-operator.testkit.js";
 
 const HAS_DB = !!process.env.DATABASE_URL;
 const ONE_TOKEN = 1_000_000n;
@@ -128,7 +127,7 @@ describe("ant-operator — operator wallet-signed exactly-once (DB)", { skip: !H
     const seed = await seedVerifiedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
 
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
     assert.equal(batch.items.length, 1);
     const item = batch.items[0];
     assert.equal(item.claimId, seed.claimId);
@@ -156,7 +155,7 @@ describe("ant-operator — operator wallet-signed exactly-once (DB)", { skip: !H
   it("double-submit of the same batch -> exactly ONE dispatch", async () => {
     const seed = await seedVerifiedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
     const signed = await operatorSignAll(batch.items.map((i) => i.txBase64), antCold);
 
     const first = await submitAntBatch(db.pool, fake, { ...submitOpts(batch.batchId), signedTxs: signed });
@@ -171,7 +170,7 @@ describe("ant-operator — operator wallet-signed exactly-once (DB)", { skip: !H
   it("replayed / foreign signed tx (no live reservation) -> rejected, never broadcast", async () => {
     const seed = await seedVerifiedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
     const signed = await operatorSignAll(batch.items.map((i) => i.txBase64), antCold);
 
     // Submit the (valid) signed tx to a DIFFERENT batch id — no reservation matches.
@@ -186,7 +185,7 @@ describe("ant-operator — operator wallet-signed exactly-once (DB)", { skip: !H
     const seed = await seedVerifiedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
     const attacker = await makeLocalAuthority(new Uint8Array(randomBytes(32)));
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
 
     // Forge a signature at the REAL ANT_COLD slot but made by the attacker's key.
     const forged = await signTxAtSlot(batch.items[0].txBase64, antCold.address, attacker.seed);
@@ -212,7 +211,7 @@ describe("ant-operator — operator wallet-signed exactly-once (DB)", { skip: !H
     for (const variant of ["redirect", "memo-strip"] as const) {
       const seed = await seedVerifiedClaim({ assetType: "ant" });
       const fake = new FakeChainGateway();
-      const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
+      const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
       const item = batch.items[0];
       const treasurySig = (decodeWire(item.txBase64).signatures as Record<string, Uint8Array | null>)[treasuryAddress];
 
@@ -243,7 +242,7 @@ describe("ant-operator — operator wallet-signed exactly-once (DB)", { skip: !H
     const fake = new FakeChainGateway();
     fake.dropBroadcast = true; // the submitted tx is "broadcast" but never lands
 
-    const batch1 = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
+    const batch1 = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
     const signed1 = await operatorSignAll(batch1.items.map((i) => i.txBase64), antCold);
     const submit1 = await submitAntBatch(db.pool, fake, { ...submitOpts(batch1.batchId), signedTxs: signed1 });
     assert.equal(submit1[0].outcome, "awaiting_confirmation");
@@ -261,7 +260,7 @@ describe("ant-operator — operator wallet-signed exactly-once (DB)", { skip: !H
 
     // Re-build (fresh blockhash) + submit; this time it lands.
     fake.dropBroadcast = false;
-    const batch2 = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
+    const batch2 = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
     assert.equal(batch2.items.length, 1);
     assert.notEqual(batch2.items[0].txid, batch1.items[0].txid, "a fresh tx (new blockhash) => new txid");
     const signed2 = await operatorSignAll(batch2.items.map((i) => i.txBase64), antCold);
@@ -274,7 +273,7 @@ describe("ant-operator — operator wallet-signed exactly-once (DB)", { skip: !H
   it("expiry BUT the tx actually landed (lagging RPC) -> outflow scan confirms, NO re-build, no double", async () => {
     const seed = await seedVerifiedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
     const signed = await operatorSignAll(batch.items.map((i) => i.txBase64), antCold);
     // It lands, but the confirm read lags and misreports `expired` once.
     fake.expiredDespiteLandedCount = 1;
@@ -306,7 +305,7 @@ describe("ant-operator — operator wallet-signed exactly-once (DB)", { skip: !H
     });
 
     // Reserve the ANT first, then race the token worker with the ANT submit.
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [antClaim.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [antClaim.assetKey] });
     const signed = await operatorSignAll(batch.items.map((i) => i.txBase64), antCold);
 
     // The worker MUST NOT dispatch the reserved ANT — with the L1/B1 guard it
@@ -333,7 +332,7 @@ describe("ant-operator — operator wallet-signed exactly-once (DB)", { skip: !H
     // Reserve into an operator batch: status stays `verified`, ant_batch_id set, and
     // NO dispatch_signature yet (so #recover would not fire — this exercises the
     // FRESH path guard specifically).
-    const batch = await buildAntBatch(db.pool, treasury, opFake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, opFake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
     assert.equal(batch.items.length, 1);
     const before = await claimRow(seed.claimId);
     assert.equal(before.status, "verified");
@@ -371,7 +370,7 @@ describe("ant-operator — operator wallet-signed exactly-once (DB)", { skip: !H
     const seed = await seedVerifiedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
     fake.dropBroadcast = true; // submit persists `dispatching` but nothing lands
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
     const signed = await operatorSignAll(batch.items.map((i) => i.txBase64), antCold);
     await submitAntBatch(db.pool, fake, { ...submitOpts(batch.batchId), signedTxs: signed });
     const before = await claimRow(seed.claimId);
@@ -428,7 +427,7 @@ describe("ant-operator — operator wallet-signed exactly-once (DB)", { skip: !H
   it("abandoned batch: reservation released back to eligible after the TTL, nothing broadcast", async () => {
     const seed = await seedVerifiedClaim({ assetType: "ant" });
     const fake = new FakeChainGateway();
-    const batch = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
+    const batch = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
     assert.equal((await claimRow(seed.claimId)).batchId, batch.batchId);
 
     // Operator never submits. A TTL sweep (ttl=0 => expire immediately) frees it.
@@ -441,7 +440,7 @@ describe("ant-operator — operator wallet-signed exactly-once (DB)", { skip: !H
     assert.equal(fake.broadcasts.length, 0, "nothing was ever broadcast");
 
     // And it can be re-built into a NEW batch.
-    const batch2 = await buildAntBatch(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
+    const batch2 = await reserveAndBuild(db.pool, treasury, fake, { antColdAddress: antCold.address, max: 50, assetKeyScope: [seed.assetKey] });
     assert.equal(batch2.items.length, 1);
     assert.equal(batch2.items[0].claimId, seed.claimId);
     // Clean up: sign+submit so nothing dangles.
