@@ -147,7 +147,12 @@ export type DispatchOutcome =
   // A still-locked vault claim: routed to the manual-delivery operator queue with
   // the correct absolute unlock timestamp instead of an auto CPI / a review loop (V).
   | "awaiting_manual_vault_delivery"
-  | "skipped";
+  | "skipped"
+  // A single claim threw while being processed (e.g. a malformed persisted signature
+  // made the recovery RPC status query reject). Isolated so ONE poison row cannot
+  // abort the whole tick and silently halt ALL dispatch; the claim's own state is
+  // unchanged (nothing was sent) and the stall is surfaced to an operator via alerts.
+  | "error";
 
 export interface DispatchResult {
   claimId: string;
@@ -186,7 +191,18 @@ export class DispatchWorker {
     const ids = await this.#eligibleClaimIds();
     const out: DispatchResult[] = [];
     for (const id of ids) {
-      out.push(await this.processClaim(id));
+      // Per-claim isolation: a single unprocessable claim (e.g. a malformed persisted
+      // signature that makes the recovery RPC status query throw) must NOT abort the
+      // whole tick and silently halt ALL dispatch for every other claimant. Catch it,
+      // surface it as an `error` result (an unchanged `dispatching` row still trips the
+      // dispatch-stalled alert), and keep processing the rest of the queue.
+      try {
+        out.push(await this.processClaim(id));
+      } catch (e) {
+        const detail = e instanceof Error ? e.message : String(e);
+        this.#log("processClaim THREW — isolating this claim, continuing the tick", { claimId: id, error: detail });
+        out.push({ claimId: id, assetKey: "", outcome: "error", detail });
+      }
     }
     return out;
   }

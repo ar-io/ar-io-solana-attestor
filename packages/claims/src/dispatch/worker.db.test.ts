@@ -207,6 +207,39 @@ describe("dispatch worker — exactly-once + custody (DB)", { skip: !HAS_DB }, (
     assert.equal(await assetStatus(seed.assetKey), "claimed");
   });
 
+  it("RESILIENCE: one poison `dispatching` claim (confirm throws) does NOT abort the tick", async () => {
+    // A: dispatched but left `dispatching` with a recorded sig, whose recovery
+    // confirm will THROW — models a malformed persisted signature the RPC rejects.
+    const a = await seedVerifiedClaim({ assetType: "token", amount: 100n * ONE_TOKEN });
+    track(a);
+    const fake = new FakeChainGateway();
+    fake.forcePendingCount = 1; // first dispatch lands but reports pending -> `dispatching`
+    const worker = await makeWorker(fake);
+    const t1 = await worker.processClaim(a.claimId);
+    assert.equal(t1.outcome, "awaiting_confirmation");
+    const aStatus = await claimStatus(a.claimId);
+    assert.equal(aStatus.status, "dispatching");
+    const aSig = aStatus.sig!;
+
+    // B: a healthy verified claim that MUST still get dispensed despite A poisoning.
+    const b = await seedVerifiedClaim({ assetType: "token", amount: 50n * ONE_TOKEN });
+    track(b);
+
+    // Poison A's recovery: confirmSignature(aSig) now throws (as a real RPC would on
+    // a malformed sig). Before the per-claim isolation fix, this rejected runOnce and
+    // B (and every other claimant) was silently never processed — a total dispatch halt.
+    fake.throwOnConfirmSig = aSig;
+
+    const results = await worker.runOnce();
+    const byId = new Map(results.map((r) => [r.claimId, r]));
+    assert.equal(byId.get(a.claimId)?.outcome, "error", "poison claim isolated as `error`");
+    assert.equal(byId.get(b.claimId)?.outcome, "confirmed", "healthy claim STILL dispensed");
+    assert.equal((await claimStatus(b.claimId)).status, "confirmed");
+    assert.equal(await assetStatus(b.assetKey), "claimed");
+    // A is untouched — nothing new sent for it (still its single original dispatching sig).
+    assert.equal((await claimStatus(a.claimId)).status, "dispatching");
+  });
+
   it("EXACTLY-ONCE: two concurrent workers on one claim -> single dispatch", async () => {
     const seed = await seedVerifiedClaim({ assetType: "token", amount: 42n * ONE_TOKEN });
     track(seed);

@@ -51,6 +51,10 @@ export class FakeChainGateway implements ChainGateway {
   /** Hook fired at the START of signTransaction (before the worker persists) —
    *  lets a test flip DB state to exercise the persist-time FOR UPDATE guard. */
   onSign?: () => Promise<void>;
+  /** Test hook: make confirmSignature THROW for one specific signature, modelling a
+   *  malformed/poison persisted signature that the real RPC rejects ("Invalid param").
+   *  Proves ONE poison `dispatching` row can no longer abort the whole worker tick. */
+  throwOnConfirmSig?: string;
 
   #wireToSig = new Map<string, string>();
   #txs = new Map<string, TxState>();
@@ -121,6 +125,9 @@ export class FakeChainGateway implements ChainGateway {
   }
 
   async confirmSignature(signature: string, lastValidBlockHeight: bigint): Promise<ConfirmState> {
+    if (this.throwOnConfirmSig && signature === this.throwOnConfirmSig) {
+      throw new Error(`simulated RPC rejection of malformed signature ${signature}`);
+    }
     if (this.forcePendingCount > 0) {
       this.forcePendingCount -= 1;
       return "pending";
