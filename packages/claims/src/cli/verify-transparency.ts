@@ -88,9 +88,22 @@ async function verifyArtifactMode(): Promise<void> {
     } else {
       const parsed = parseAnchorMemo(fetched.memo);
       const anchorAddress = resolveAnchorAddress();
-      if (anchorAddress) check("ledger-root anchor signed by pinned key", anchorSignedBy(fetched, anchorAddress), `signer=${fetched.feePayer}`);
+      // The memo BODY is forgeable by ANY funded key (~5000 lamports); the ONLY
+      // binding to the operator is the on-chain SIGNER. An anchor whose signer we
+      // cannot pin is NOT a root pin — refuse it, exactly as the audit-log
+      // extension path does. Without this, a self-signed forged ledger + a memo
+      // posted from a random wallet would print ALL CHECKS PASSED.
+      if (!anchorAddress) {
+        check("ledger-root anchor SIGNER pinned (--anchor-address / --publisher)", false,
+          "a --ledger-anchor-sig with no pinned signer proves nothing: any funded key can post the memo body");
+        return; // never treat an unverifiable anchor as a root pin
+      }
+      const anchorSignedByPinned = anchorSignedBy(fetched, anchorAddress);
+      check("ledger-root anchor SIGNED by the pinned publisher/anchor key", anchorSignedByPinned,
+        `signer=${fetched.feePayer} expected=${anchorAddress}`);
       if (parsed && parsed.kind === "ledger-root") {
-        rootPinned = parsed.hashHex === artifact.manifest.rootHex.toLowerCase();
+        // Pin ONLY when the anchor was signed by the pinned key AND the root matches.
+        rootPinned = anchorSignedByPinned && parsed.hashHex === artifact.manifest.rootHex.toLowerCase();
         check("artifact root == ON-CHAIN anchored ledger root", rootPinned, `onchain=${parsed.hashHex} artifact=${artifact.manifest.rootHex}`);
       } else {
         check("anchor is an ar.io ledger-root anchor", false, `memo="${fetched.memo}"`);

@@ -29,6 +29,10 @@ import {
   type BuiltAsset,
 } from "../reconcile/reconcile.js";
 
+// Time-DEPENDENT oracle counts — valid only at the published gate reference nowMs.
+// The absolute per-phase mARIO tamper pins are deliberately NOT here: they are
+// nowMs-independent (MED-C) and the caller asserts them UNCONDITIONALLY, so a
+// cutover that re-pins nowMs cannot silently disable that conservation tripwire.
 function checkGate(
   label: string,
   counters: {
@@ -37,11 +41,6 @@ function checkGate(
     vaultEscrowed: number;
     stakeEscrowed: number;
   },
-  // Absolute per-phase mARIO totals — pinned in EXPECTED_GATE (MED-C) so a
-  // tampered vault/stake `amountMario` (which slips past the count-only pins
-  // and the bit-exact diff, since both sides read the same poisoned file) is
-  // caught here on whichever derivation supplies these totals.
-  mario: { vaultMario: bigint; stakeMario: bigint },
 ): string[] {
   const fails: string[] = [];
   const g = EXPECTED_GATE;
@@ -54,7 +53,6 @@ function checkGate(
   cmp("stakeEscrowed", counters.stakeEscrowed, g.stakeEscrowed);
   const total = counters.ant + counters.tokenEscrowed + counters.vaultEscrowed + counters.stakeEscrowed;
   cmp("total", total, g.total);
-  fails.push(...checkVaultStakeMarioGate(label, mario.vaultMario, mario.stakeMario));
   return fails;
 }
 
@@ -80,9 +78,10 @@ async function main(): Promise<void> {
   if (!gateApplies) {
     console.log(
       `NOTE: nowMs != the published gate reference (${EXPECTED_GATE.nowMs}); the\n` +
-        "      hardcoded oracle counts (2269/5374/111/2957) are time-dependent and\n" +
-        "      will be SKIPPED. The bit-exact builder-vs-authoritative diff (nowMs-\n" +
-        "      agnostic) remains the operative gate.",
+        "      hardcoded oracle COUNTS (2269/5374/111/2957) are time-dependent and\n" +
+        "      will be SKIPPED. The nowMs-INDEPENDENT checks STILL run: the bit-exact\n" +
+        "      builder-vs-authoritative diff AND the absolute per-phase mARIO tamper\n" +
+        "      pins (vault/stake/token-outflow, MED-C).",
     );
   }
 
@@ -108,19 +107,18 @@ async function main(): Promise<void> {
     `authoritative phase mARIO: vault=${authoritative.phase3VaultMario} ` +
       `stake=${authoritative.phase4StakeMario}`,
   );
-  if (gateApplies) {
+  // Absolute per-phase mARIO tamper pins (MED-C) are nowMs-INDEPENDENT — assert on
+  // EVERY run so a cutover that re-pins nowMs cannot silently disable the tripwire.
+  fails.push(...checkVaultStakeMarioGate("authoritative", authoritative.phase3VaultMario, authoritative.phase4StakeMario));
+  if (authoritative.phase2TokenOutflowMario !== EXPECTED_GATE.phase2TokenOutflowMario) {
     fails.push(
-      ...checkGate("authoritative", authoritative.counters, {
-        vaultMario: authoritative.phase3VaultMario,
-        stakeMario: authoritative.phase4StakeMario,
-      }),
+      `authoritative.phase2TokenOutflow: got ${authoritative.phase2TokenOutflowMario}, ` +
+        `expected ${EXPECTED_GATE.phase2TokenOutflowMario}`,
     );
-    if (authoritative.phase2TokenOutflowMario !== EXPECTED_GATE.phase2TokenOutflowMario) {
-      fails.push(
-        `authoritative.phase2TokenOutflow: got ${authoritative.phase2TokenOutflowMario}, ` +
-          `expected ${EXPECTED_GATE.phase2TokenOutflowMario}`,
-      );
-    }
+  }
+  // Time-DEPENDENT oracle counts only assert at the published gate reference.
+  if (gateApplies) {
+    fails.push(...checkGate("authoritative", authoritative.counters));
   }
 
   // --- MY builder's plan (for gate + optional in-memory compare) ------------
@@ -142,19 +140,16 @@ async function main(): Promise<void> {
   if (plan.atRiskRecipientCount !== EXPECTED_GATE.atRisk) {
     fails.push(`AT-RISK count: got ${plan.atRiskRecipientCount}, expected ${EXPECTED_GATE.atRisk}`);
   }
-  if (gateApplies) {
+  // Absolute per-phase mARIO tamper pins (MED-C) — nowMs-independent, asserted always.
+  fails.push(...checkVaultStakeMarioGate("built", plan.phase3VaultMario, plan.phase4StakeMario));
+  if (plan.phase2TokenOutflowMario !== EXPECTED_GATE.phase2TokenOutflowMario) {
     fails.push(
-      ...checkGate("built", plan.counters, {
-        vaultMario: plan.phase3VaultMario,
-        stakeMario: plan.phase4StakeMario,
-      }),
+      `built.phase2TokenOutflow: got ${plan.phase2TokenOutflowMario}, ` +
+        `expected ${EXPECTED_GATE.phase2TokenOutflowMario}`,
     );
-    if (plan.phase2TokenOutflowMario !== EXPECTED_GATE.phase2TokenOutflowMario) {
-      fails.push(
-        `built.phase2TokenOutflow: got ${plan.phase2TokenOutflowMario}, ` +
-          `expected ${EXPECTED_GATE.phase2TokenOutflowMario}`,
-      );
-    }
+  }
+  if (gateApplies) {
+    fails.push(...checkGate("built", plan.counters));
   }
 
   // --- The bit-exact diff ---------------------------------------------------
