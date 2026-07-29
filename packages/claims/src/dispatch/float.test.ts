@@ -47,6 +47,7 @@ describe("FloatManager.status", () => {
   function stubGateway(balance: bigint): ChainGateway {
     return {
       getTokenBalance: async () => balance,
+      getSolBalance: async () => 0n,
       accountExists: async () => true,
       getBlockHeight: async () => 1000n,
       signTransaction: async () => { throw new Error("unused"); },

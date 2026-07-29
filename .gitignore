@@ -11,3 +11,6 @@ packages/*/dist/
 
 # staging/rehearsal run artifacts (outputs, not source)
 packages/claims/scripts/rehearsal-out/
+
+# published-ledger transparency artifacts (signed Merkle output of publish:ledger, not source)
+packages/claims/ledger-artifact.*.json

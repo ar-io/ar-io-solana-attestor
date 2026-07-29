@@ -12,7 +12,7 @@
 import type { Pool } from "pg";
 import type { Rpc, SolanaRpcApi } from "@solana/kit";
 
-import type { Config } from "../config.js";
+import { DEFAULT_SOL_LOW_THRESHOLD_LAMPORTS, type Config } from "../config.js";
 import type { ChainGateway } from "../dispatch/chain.js";
 import { FloatManager } from "../dispatch/float.js";
 import { floatPolicyFromEnv } from "../dispatch/dispatch-config.js";
@@ -35,29 +35,47 @@ export interface MetricsDeps {
   ensureChain: () => { rpc: Rpc<SolanaRpcApi>; gateway: ChainGateway };
 }
 
-/** Optional chain-read blocks (float + reserves); {} when not configured/reachable. */
+/** Optional chain-read blocks (float + reserves + dispenser SOL); {} when not
+ *  configured/reachable. */
 async function chainExtras(deps: MetricsDeps): Promise<MetricsExtras> {
   const { pool, config, tconfig } = deps;
-  if (!tconfig.mint || !tconfig.hotDispenser) return {};
   const extras: MetricsExtras = {};
+  if (!tconfig.hotDispenser) return extras;
+
+  // Hot dispenser native SOL (needs only the treasury address). Guarded on its own
+  // so a blip here doesn't drop the float/reserves blocks (and vice-versa).
   try {
-    const { rpc, gateway } = deps.ensureChain();
-    const fm = new FloatManager(floatPolicyFromEnv(config.bigClaimThresholdMario));
-    const hotAta = await getAssociatedTokenAddress(tconfig.hotDispenser, tconfig.mint);
-    extras.float = await fm.status(pool, gateway, hotAta);
-    extras.reserves = await computeReserves({
-      pool,
-      gateway,
-      rpc,
-      network: config.network,
-      mint: tconfig.mint,
-      hotDispenser: tconfig.hotDispenser,
-      coldReserve: tconfig.coldReserve,
-      antAuthority: tconfig.antAuthority,
-      antCheck: tconfig.antCheck,
-    });
+    const { gateway } = deps.ensureChain();
+    const balanceLamports = await gateway.getSolBalance(tconfig.hotDispenser);
+    extras.dispenserSol = {
+      balanceLamports,
+      thresholdLamports: config.solLowThresholdLamports ?? DEFAULT_SOL_LOW_THRESHOLD_LAMPORTS,
+    };
   } catch {
-    // Chain unreachable / reserves misconfig — DB metrics still serve.
+    // Chain unreachable — DB metrics + other chain blocks still serve.
+  }
+
+  // Float + reserves additionally need the mint.
+  if (tconfig.mint) {
+    try {
+      const { rpc, gateway } = deps.ensureChain();
+      const fm = new FloatManager(floatPolicyFromEnv(config.bigClaimThresholdMario));
+      const hotAta = await getAssociatedTokenAddress(tconfig.hotDispenser, tconfig.mint);
+      extras.float = await fm.status(pool, gateway, hotAta);
+      extras.reserves = await computeReserves({
+        pool,
+        gateway,
+        rpc,
+        network: config.network,
+        mint: tconfig.mint,
+        hotDispenser: tconfig.hotDispenser,
+        coldReserve: tconfig.coldReserve,
+        antAuthority: tconfig.antAuthority,
+        antCheck: tconfig.antCheck,
+      });
+    } catch {
+      // Chain unreachable / reserves misconfig — DB metrics still serve.
+    }
   }
   return extras;
 }

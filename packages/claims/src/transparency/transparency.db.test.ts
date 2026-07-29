@@ -37,6 +37,9 @@ class MapGateway implements ChainGateway {
   async getTokenBalance(ata: Address): Promise<bigint> {
     return this.balances.get(ata as string) ?? 0n;
   }
+  async getSolBalance(): Promise<bigint> {
+    return 0n;
+  }
   async accountExists(): Promise<boolean> {
     return true;
   }

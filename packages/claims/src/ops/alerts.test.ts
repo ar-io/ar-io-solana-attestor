@@ -55,8 +55,47 @@ describe("evaluateAlerts — each condition fires", () => {
   it("float-low (warning) when refill needed", () => {
     const s = healthy(); s.float!.refillNeeded = true; s.float!.availableMario = "10";
     const a = evaluateAlerts(s);
-    assert.ok(a.some((x) => x.name === "float-low" && x.severity === "warning"));
+    const fl = a.find((x) => x.name === "float-low");
+    assert.ok(fl && fl.severity === "warning");
     assert.equal(worstSeverity(a), "warning");
+  });
+
+  it("float-low message includes the available float + refill threshold (ARIO)", () => {
+    const s = healthy();
+    s.float!.refillNeeded = true;
+    s.float!.availableMario = "50000000000";       // 50k ARIO
+    s.float!.refillThresholdMario = "100000000000"; // 100k ARIO
+    const fl = evaluateAlerts(s).find((x) => x.name === "float-low");
+    assert.ok(fl);
+    assert.ok(fl!.message.includes("50000 ARIO"), fl!.message);
+    assert.ok(fl!.message.includes("100000 ARIO"), fl!.message);
+  });
+
+  it("dispenser-sol-low (warning) below threshold, and NOT above it", () => {
+    const below = healthy();
+    below.dispenserSol = { balanceLamports: "300000000", thresholdLamports: "500000000" }; // 0.3 < 0.5 SOL
+    const a = evaluateAlerts(below);
+    const sol = a.find((x) => x.name === "dispenser-sol-low");
+    assert.ok(sol && sol.severity === "warning", "fires warning below threshold");
+    assert.equal(sol!.value, "300000000");
+    assert.equal(sol!.threshold, "500000000");
+
+    const above = healthy();
+    above.dispenserSol = { balanceLamports: "600000000", thresholdLamports: "500000000" }; // 0.6 > 0.5 SOL
+    assert.equal(evaluateAlerts(above).some((x) => x.name === "dispenser-sol-low"), false, "quiet above threshold");
+  });
+
+  it("dispenser-sol-low escalates to critical when near-empty (< 10% of threshold)", () => {
+    const s = healthy();
+    s.dispenserSol = { balanceLamports: "10000000", thresholdLamports: "500000000" }; // 0.01 SOL, < 10% of 0.5
+    const sol = evaluateAlerts(s).find((x) => x.name === "dispenser-sol-low");
+    assert.ok(sol && sol.severity === "critical");
+    assert.equal(worstSeverity(evaluateAlerts(s)), "critical");
+  });
+
+  it("dispenser-sol-low is skipped when the SOL block is absent (RPC blip / not configured)", () => {
+    const s = healthy(); // no dispenserSol
+    assert.equal(evaluateAlerts(s).some((x) => x.name === "dispenser-sol-low"), false);
   });
 
   it("float-over-cap (warning) when the hot key holds more than the cap", () => {

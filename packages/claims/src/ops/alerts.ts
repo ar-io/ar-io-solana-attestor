@@ -42,6 +42,10 @@ export interface AlertThresholds {
   /** Anchor cadence: warn when the last audit-head anchor is older than 2× this
    *  (default cadence 24h ⇒ warn > 48h). */
   anchorCadenceSeconds: number;
+  /** When false, the anchor-failure / anchor-unconfirmed alerts are suppressed — for
+   *  deployments that deliberately do NOT anchor the audit log on-chain (the log stays
+   *  append-only + hash-chained locally; only the on-chain checkpoint is skipped). */
+  anchorAlertsEnabled: boolean;
   /** `failed` claims at/above this count escalate critical (default 1 → any failure). */
   dispatchFailureCritical: number;
 }
@@ -51,6 +55,7 @@ export const DEFAULT_THRESHOLDS: AlertThresholds = {
   reviewSlaSeconds: 24 * 3600,
   dispatchStallSeconds: 10 * 60,
   anchorCadenceSeconds: 24 * 3600,
+  anchorAlertsEnabled: true,
   dispatchFailureCritical: 1,
 };
 
@@ -66,6 +71,7 @@ export function loadAlertThresholds(env: NodeJS.ProcessEnv = process.env): Alert
     reviewSlaSeconds: num("ALERT_REVIEW_SLA_SECONDS", DEFAULT_THRESHOLDS.reviewSlaSeconds),
     dispatchStallSeconds: num("ALERT_DISPATCH_STALL_SECONDS", DEFAULT_THRESHOLDS.dispatchStallSeconds),
     anchorCadenceSeconds: num("ALERT_ANCHOR_CADENCE_SECONDS", DEFAULT_THRESHOLDS.anchorCadenceSeconds),
+    anchorAlertsEnabled: (env.ALERT_ANCHOR_ENABLED ?? "true") !== "false",
     dispatchFailureCritical: num("ALERT_DISPATCH_FAILURE_CRITICAL", DEFAULT_THRESHOLDS.dispatchFailureCritical),
   };
 }
@@ -132,13 +138,35 @@ export function evaluateAlerts(s: MetricsSnapshot, t: AlertThresholds = DEFAULT_
     });
   }
 
+  // --- dispenser-sol-low (CRITICAL near-empty / else WARNING) — fee + rent budget. ---
+  // The hot dispenser (fee payer) pays tx fees + recipient-ATA rent from native SOL.
+  // If it runs dry, dispatch stalls even with plenty of ARIO float — nudge the
+  // operator to top the treasury key up. Critical once it's near-empty (< 10% of the
+  // threshold ≈ only a handful of dispenses left), else a warning.
+  if (s.dispenserSol) {
+    const balance = BigInt(s.dispenserSol.balanceLamports);
+    const threshold = BigInt(s.dispenserSol.thresholdLamports);
+    if (balance < threshold) {
+      const nearEmpty = balance < threshold / 10n;
+      alerts.push({
+        name: "dispenser-sol-low",
+        severity: nearEmpty ? "critical" : "warning",
+        message: `hot dispenser SOL ${solStr(balance)} is below the ${solStr(threshold)} top-up threshold — it pays tx fees + recipient-ATA rent, so dispatch will stall when it runs dry. Top up the treasury key.`,
+        value: `${balance}`,
+        threshold: `${threshold}`,
+      });
+    }
+  }
+
   // --- float-low (WARNING) — top up the hot float from cold. ---
   if (s.float && s.float.refillNeeded) {
+    const thr = s.float.refillThresholdMario;
     alerts.push({
       name: "float-low",
       severity: "warning",
-      message: `hot float available ${s.float.availableMario} mARIO is below the refill threshold — top up from the cold reserve (4-eyes runbook).`,
+      message: `hot float available ${arioStr(s.float.availableMario)} is below the ${thr ? arioStr(thr) : "refill"} threshold — top up from the cold reserve (4-eyes runbook).`,
       value: s.float.availableMario,
+      threshold: thr,
     });
   }
 
@@ -184,7 +212,9 @@ export function evaluateAlerts(s: MetricsSnapshot, t: AlertThresholds = DEFAULT_
     });
   }
 
-  // --- anchor-failure (WARNING) — audit head not anchored in the window. ---
+  // --- anchor-failure (WARNING) — audit head not anchored in the window. Suppressed
+  //     entirely when ALERT_ANCHOR_ENABLED=false (deployment opts out of on-chain anchoring). ---
+  if (t.anchorAlertsEnabled) {
   const anchorWarnAt = t.anchorCadenceSeconds * 2;
   if (s.anchors.lastAuditHeadAnchorAgeSec === null) {
     // Only alert on a missing anchor once there IS an audit log to anchor.
@@ -212,6 +242,7 @@ export function evaluateAlerts(s: MetricsSnapshot, t: AlertThresholds = DEFAULT_
       value: "unconfirmed",
     });
   }
+  } // end anchorAlertsEnabled
 
   // --- audit-unsigned-backlog (WARNING) — signatures not backfilled. ---
   if (s.audit.unsignedRows > 0) {
@@ -224,6 +255,19 @@ export function evaluateAlerts(s: MetricsSnapshot, t: AlertThresholds = DEFAULT_
   }
 
   return alerts;
+}
+
+/** Render lamports as a human "X.YYY SOL (N lamports)" string for alert bodies. */
+function solStr(lamports: bigint): string {
+  const whole = lamports / 1_000_000_000n;
+  const frac = (lamports % 1_000_000_000n).toString().padStart(9, "0").replace(/0+$/, "");
+  return `${whole}${frac ? "." + frac : ""} SOL (${lamports} lamports)`;
+}
+
+/** Render mARIO as a human "X ARIO (N mARIO)" string for alert bodies. */
+function arioStr(marioStrOrBig: string | bigint): string {
+  const mario = typeof marioStrOrBig === "bigint" ? marioStrOrBig : BigInt(marioStrOrBig);
+  return `${mario / 1_000_000n} ARIO (${mario} mARIO)`;
 }
 
 /** The most severe alert level firing (for an exit code / overall status). */

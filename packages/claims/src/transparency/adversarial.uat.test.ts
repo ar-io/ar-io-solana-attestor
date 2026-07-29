@@ -302,6 +302,7 @@ describe("M6 UAT — reserves false-surplus", { skip: !HAS_DB }, () => {
   class MapGateway implements ChainGateway {
     constructor(private readonly bal: Map<string, bigint>) {}
     async getTokenBalance(a: Address): Promise<bigint> { return this.bal.get(a as string) ?? 0n; }
+    async getSolBalance(): Promise<bigint> { return 0n; }
     async accountExists(): Promise<boolean> { return true; }
     async getBlockHeight(): Promise<bigint> { return 1n; }
     async signTransaction(): Promise<never> { throw new Error("unused"); }
