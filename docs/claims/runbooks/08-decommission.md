@@ -72,10 +72,28 @@ executable checklist — tick each box.
 
 ## Teardown
 
-- [ ] **Do NOT tear down the on-chain escrow program.** It stays deployed as the
-      fallback so late claimants can still be served on the trustless path from the
-      frozen inputs (`batch-escrow.ts`). Keep the **attestor** running as long as
-      any on-chain escrow remains claimable.
+- [ ] **RECLAIM the stranded ~2 SOL at final wind-down (MUST NOT be forgotten).**
+      2.000001 SOL of operator funds sits on the escrow **program account**
+      `5HZhe9UqKL5zAsdz81nuuaxV41h8bFhudzxxBigAQndM` (sent to the program id, not a
+      wallet, during 2026-08 funding). It is recoverable ONLY via `solana program
+      close` (needs the upgrade authority), which is a wind-down-only action — so it
+      is deferred, NOT abandoned. When the fallback is retired, close with a named
+      `--recipient` to sweep it back. See the refund note below.
+- [ ] **Do NOT tear down the on-chain escrow program** *before* wind-down. It stays
+      deployed as the fallback so late claimants can still be served on the trustless
+      path from the frozen inputs (`batch-escrow.ts`). Keep the **attestor** running
+      as long as any on-chain escrow remains claimable.
+      - **Expected refund when you DO close it at final wind-down (~6.31 SOL, not
+        ~4.31):** the escrow program id
+        `5HZhe9UqKL5zAsdz81nuuaxV41h8bFhudzxxBigAQndM` carries an extra
+        **2.000001 SOL** of operator funds — 2 SOL was accidentally sent to the
+        *program id itself* (not a wallet) during 2026-08 hot-wallet funding and is
+        recoverable ONLY via `solana program close`. So a close returns ≈ **6.31 SOL**
+        (2.000001 excess + 4.30872 programdata rent), not the ~4.31 the programdata
+        rent alone would suggest. The extra ~2 SOL is expected — do **not** flag it
+        as an anomaly. Closing still destroys the fallback escrow **and** the one
+        pre-existing user `EscrowToken` (50 ARIO) claimable only there, so this is a
+        final-wind-down action only.
 - [ ] **Retire the service keys**: revoke/retire the treasury, audit, and
       publisher keys (the ANT-cold/authority key follows the authority lifecycle,
       not this service). Post the **final audit-log anchor** first — after
