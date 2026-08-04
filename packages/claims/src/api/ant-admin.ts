@@ -14,8 +14,9 @@ import bs58 from "bs58";
 import type { Pool } from "pg";
 import type { Address, TransactionSigner } from "@solana/kit";
 
-import type { AntDispatchMode } from "../config.js";
+import type { AntDispatchMode, Network } from "../config.js";
 import type { AntChainGateway } from "../dispatch/chain.js";
+import type { SlackNotify } from "../ops/slack.js";
 import { ApiError } from "./errors.js";
 
 /** The admin actions a challenge signature may authorize (route-binding).
@@ -203,6 +204,13 @@ export interface AntAdminContext {
   requireApproval: boolean;
   includeMemo: boolean;
   challengeStore: AntChallengeStore;
+  /** The network this admin process serves — drives the explorer `?cluster=devnet`
+   *  suffix in Slack messages. Optional so bare test contexts default to mainnet. */
+  network?: Network;
   log?: (msg: string, extra?: Record<string, unknown>) => void;
   alert?: (a: { name: string; severity: "critical" | "warning"; message: string; claimId: string }) => void;
+  /** Opt-in Slack sink for ANT batch submissions. Fire-and-forget; a no-op when
+   *  `SLACK_WEBHOOK_URL` is unset. NEVER awaited and NEVER allowed to affect a
+   *  response or the money path. */
+  slackNotify?: SlackNotify;
 }

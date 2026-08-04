@@ -71,7 +71,25 @@ export interface Config {
   antReservationTtlMs?: number;
   /** The ANT-authority pubkey (base58). Required when antDispatchMode=operator-wallet. */
   antColdAddress?: string;
+  /**
+   * Opt-in Slack incoming-webhook URL for operator notifications (ANT batch
+   * submissions + claim approvals). UNSET = feature off (default), exactly like
+   * `CORS_ALLOWED_ORIGINS`. It is NEVER required and notifications are strictly
+   * fire-and-forget: a Slack outage or misconfig can never block/break dispatch.
+   */
+  slackWebhookUrl?: string;
+  /**
+   * Balance-low alert threshold for the hot dispenser's native SOL (lamports).
+   * The treasury/fee-payer key pays tx fees + recipient-ATA rent from SOL; when it
+   * drops below this, dispatch stalls and the operator must top it up. Read by the
+   * ops-alert path (worker loop + `ops:metrics`). Default `DEFAULT_SOL_LOW_THRESHOLD_LAMPORTS`
+   * (0.5 SOL). Purely a monitoring signal — never gates the money path.
+   */
+  solLowThresholdLamports?: bigint;
 }
+
+/** Default hot-dispenser SOL-low threshold: 0.5 SOL (1 SOL = 1e9 lamports). */
+export const DEFAULT_SOL_LOW_THRESHOLD_LAMPORTS = 500_000_000n;
 
 export type Network = "solana-mainnet" | "solana-devnet" | "localnet";
 export type AntDispatchMode = "operator-wallet" | "cli-cold";
@@ -142,6 +160,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`ANT_RESERVATION_TTL_MS must be a positive integer, got "${env.ANT_RESERVATION_TTL_MS}"`);
   }
 
+  let solLowThresholdLamports = DEFAULT_SOL_LOW_THRESHOLD_LAMPORTS;
+  if (env.SOL_LOW_THRESHOLD_LAMPORTS !== undefined && env.SOL_LOW_THRESHOLD_LAMPORTS.trim() !== "") {
+    const raw = env.SOL_LOW_THRESHOLD_LAMPORTS.trim();
+    if (!/^\d+$/.test(raw)) {
+      throw new Error(`SOL_LOW_THRESHOLD_LAMPORTS must be a non-negative integer (lamports), got "${env.SOL_LOW_THRESHOLD_LAMPORTS}"`);
+    }
+    solLowThresholdLamports = BigInt(raw);
+  }
+
   return {
     port,
     host: env.HOST ?? "0.0.0.0",
@@ -161,6 +188,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     antBatchMax,
     antReservationTtlMs,
     antColdAddress: env.ANT_COLD_ADDRESS && env.ANT_COLD_ADDRESS.length > 0 ? env.ANT_COLD_ADDRESS : undefined,
+    slackWebhookUrl: env.SLACK_WEBHOOK_URL && env.SLACK_WEBHOOK_URL.trim().length > 0 ? env.SLACK_WEBHOOK_URL.trim() : undefined,
+    solLowThresholdLamports,
   };
 }
 

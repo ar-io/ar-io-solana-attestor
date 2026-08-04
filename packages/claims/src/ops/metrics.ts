@@ -80,8 +80,16 @@ export interface MetricsSnapshot extends DbMetrics {
     reservedMario: string;
     availableMario: string;
     capMario: string;
+    /** Refill threshold the float was evaluated against (mARIO); present when computed. */
+    refillThresholdMario?: string;
     refillNeeded: boolean;
     overCap: boolean;
+  };
+  /** hot dispenser native SOL (chain-read); present when the caller computed it.
+   *  Fee-payer/ATA-rent budget — dispatch stalls if this runs dry. Lamports. */
+  dispenserSol?: {
+    balanceLamports: string;
+    thresholdLamports: string;
   };
   /** reserves-vs-liabilities coverage (chain-read); present when computed. */
   reserves?: {
@@ -225,6 +233,8 @@ export async function collectDbMetrics(pool: Pool): Promise<DbMetrics> {
 export interface MetricsExtras {
   float?: FloatStatus;
   reserves?: ReservesReport;
+  /** Hot dispenser SOL balance + its low-water threshold (lamports). */
+  dispenserSol?: { balanceLamports: bigint; thresholdLamports: bigint };
 }
 
 /** DB metrics + optional chain-derived float/reserves blocks. */
@@ -237,8 +247,15 @@ export async function collectMetrics(pool: Pool, extras: MetricsExtras = {}): Pr
       reservedMario: extras.float.reservedMario.toString(),
       availableMario: extras.float.availableMario.toString(),
       capMario: extras.float.capMario.toString(),
+      refillThresholdMario: extras.float.refillThresholdMario.toString(),
       refillNeeded: extras.float.refillNeeded,
       overCap: extras.float.overCap,
+    };
+  }
+  if (extras.dispenserSol) {
+    snapshot.dispenserSol = {
+      balanceLamports: extras.dispenserSol.balanceLamports.toString(),
+      thresholdLamports: extras.dispenserSol.thresholdLamports.toString(),
     };
   }
   if (extras.reserves) {
@@ -313,6 +330,12 @@ export function renderPrometheus(s: MetricsSnapshot): string {
     out.push(line("float_cap_ario", arioNum(s.float.capMario)));
     out.push(line("float_refill_needed", s.float.refillNeeded ? 1 : 0));
     out.push(line("float_over_cap", s.float.overCap ? 1 : 0));
+  }
+  if (s.dispenserSol) {
+    // Integer lamports (keeps the exposition all-integer, like the other gauges).
+    out.push("# TYPE claims_dispenser_sol_lamports gauge");
+    out.push(line("dispenser_sol_balance_lamports", s.dispenserSol.balanceLamports));
+    out.push(line("dispenser_sol_threshold_lamports", s.dispenserSol.thresholdLamports));
   }
   if (s.reserves) {
     out.push("# TYPE claims_reserves gauge");

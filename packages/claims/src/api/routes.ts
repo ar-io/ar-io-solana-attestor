@@ -48,7 +48,10 @@ import {
   releaseAntBatch,
   reserveAntBatch,
   submitAntBatch,
+  type AntBatchStatus,
+  type AntSubmitResult,
 } from "../dispatch/ant-operator.js";
+import type { Network } from "../config.js";
 
 export interface ClaimsRoutesDeps {
   config: Config;
@@ -327,6 +330,49 @@ function assertUuid(batchId: string): string {
  * DEDICATED admin server (cli/ant-admin-serve.ts) can serve them on its own port,
  * SEPARATE from the public claim API. Absent `antAdmin` => every route 503s.
  */
+/** ANT submit outcomes that count as a landed transfer (for the header tally). */
+const ANT_CONFIRMED_OUTCOMES = new Set(["confirmed", "already_confirmed", "recovered_confirmed"]);
+
+/** Abbreviate a long base58 id (mint / asset key) for an operator-readable line. */
+function shortId(id: string): string {
+  return id.length > 12 ? `${id.slice(0, 4)}…${id.slice(-4)}` : id;
+}
+
+/**
+ * Compose the operator-readable Slack message for an ANT batch submission. Pure +
+ * total-failure-proof (used only from a fire-and-forget path): a header tally plus
+ * one line per claim (ArNS name or short mint, outcome, and — for confirmed ones —
+ * an explorer link, `?cluster=devnet` on devnet). Non-confirmed outcomes are flagged.
+ */
+export function composeAntSubmitSlackMessage(
+  batchId: string,
+  results: AntSubmitResult[],
+  status: AntBatchStatus | null,
+  network: Network | undefined,
+): { text: string } {
+  const confirmedCount = results.filter((r) => ANT_CONFIRMED_OUTCOMES.has(r.outcome)).length;
+  const total = results.length;
+  const clusterSuffix = network === "solana-devnet" ? "?cluster=devnet" : "";
+  const byClaim = new Map<string, { antName: string | null; antMint: string | null }>();
+  for (const c of status?.claims ?? []) byClaim.set(c.claimId, { antName: c.antName, antMint: c.antMint });
+
+  const lines = results.map((r) => {
+    const meta = r.claimId ? byClaim.get(r.claimId) : undefined;
+    const label =
+      meta?.antName ||
+      (meta?.antMint ? shortId(meta.antMint) : r.assetKey ? shortId(r.assetKey) : "unknown");
+    const confirmed = ANT_CONFIRMED_OUTCOMES.has(r.outcome);
+    if (confirmed && r.signature) {
+      return `• ${label} — ${r.outcome}  https://explorer.solana.com/tx/${r.signature}${clusterSuffix}`;
+    }
+    const detail = r.detail ? ` (${r.detail})` : "";
+    return `• ⚠️ ${label} — ${r.outcome}${detail}`;
+  });
+
+  const header = `🅰️ ANT batch ${batchId.slice(0, 8)} submitted — ${confirmedCount}/${total} confirmed`;
+  return { text: [header, ...lines].join("\n") };
+}
+
 export function registerAntAdminRoutes(app: FastifyInstance, antAdmin?: AntAdminContext): void {
   const requireAdmin = (): AntAdminContext => {
     if (!antAdmin) {
@@ -444,6 +490,16 @@ export function registerAntAdminRoutes(app: FastifyInstance, antAdmin?: AntAdmin
         alert: ctx.alert,
       });
       reply.send({ batchId, results });
+      // Opt-in Slack notification — fully DECOUPLED from the response and the money
+      // path: the reply is already sent, this is never awaited, and both the DB read
+      // and the notifier swallow all errors. A Slack outage cannot block/break submit.
+      if (ctx.slackNotify) {
+        const notify = ctx.slackNotify;
+        void (async () => {
+          const status = await getAntBatchStatus(ctx.pool, batchId).catch(() => null);
+          notify(composeAntSubmitSlackMessage(batchId, results, status, ctx.network));
+        })().catch((err) => ctx.log?.("slack submit notify failed", { err }));
+      }
     } catch (e) {
       sendApiError(reply, e);
     }

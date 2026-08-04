@@ -31,6 +31,7 @@ interface TxState {
 
 export class FakeChainGateway implements ChainGateway {
   balance = 1_000_000_000_000n; // plenty of float by default
+  solBalance = 1_000_000_000n; // 1 SOL — plenty for fees by default
   blockHeight = 1000n;
   signCount = 0;
   broadcasts: string[] = [];
@@ -62,6 +63,10 @@ export class FakeChainGateway implements ChainGateway {
   async getTokenBalance(_ata: Address): Promise<bigint> {
     void _ata;
     return this.balance;
+  }
+  async getSolBalance(_owner: Address): Promise<bigint> {
+    void _owner;
+    return this.solBalance;
   }
   async accountExists(_addr: Address): Promise<boolean> {
     void _addr;

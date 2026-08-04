@@ -112,6 +112,15 @@ export interface AntChainGateway {
 export interface ChainGateway {
   /** SPL token balance of `ata` in mARIO; 0n if the account does not exist. */
   getTokenBalance(ata: Address): Promise<bigint>;
+  /**
+   * Native SOL balance of `owner` in lamports (the fee-payer / dispenser key holds
+   * the SOL that pays tx fees + recipient-ATA rent). Reuses the same confirm RPC —
+   * a monitoring read only, NEVER on the exactly-once send path. THROWS on an RPC
+   * error (unlike `getTokenBalance`, which returns 0n for an absent account) so a
+   * transient blip is not mistaken for an empty balance and never fires a false
+   * SOL-low critical — the ops-alert callers guard this read independently.
+   */
+  getSolBalance(owner: Address): Promise<bigint>;
   /** Does the account exist on-chain? */
   accountExists(addr: Address): Promise<boolean>;
   /** Current block height (for blockhash-expiry checks). */
@@ -171,6 +180,13 @@ export class SolanaChainGateway implements ChainGateway {
     } catch {
       return 0n; // account absent / not a token account
     }
+  }
+
+  async getSolBalance(owner: Address): Promise<bigint> {
+    // Reuse the confirm RPC; propagate errors (see interface doc) so a blip never
+    // reads as an empty balance.
+    const res = await this.#rpc.getBalance(owner).send();
+    return BigInt(res.value);
   }
 
   async accountExists(addr: Address): Promise<boolean> {

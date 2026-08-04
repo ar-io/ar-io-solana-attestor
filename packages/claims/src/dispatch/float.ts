@@ -35,6 +35,8 @@ export interface FloatStatus {
   /** balanceMario - reservedMario, floored at 0. */
   availableMario: bigint;
   capMario: bigint;
+  /** The refill threshold this status was evaluated against (mARIO). */
+  refillThresholdMario: bigint;
   /** available < refillThreshold => top up from cold (operator). */
   refillNeeded: boolean;
   /** balance > cap => operator overfunded the hot key (policy violation). */
@@ -107,6 +109,7 @@ export class FloatManager {
       reservedMario,
       availableMario,
       capMario: this.#policy.capMario,
+      refillThresholdMario: this.#policy.refillThresholdMario,
       refillNeeded: availableMario < this.#policy.refillThresholdMario,
       overCap: balanceMario > this.#policy.capMario,
     };

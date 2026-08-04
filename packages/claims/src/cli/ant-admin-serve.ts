@@ -28,6 +28,7 @@ import { assertBootConfig, BootConfigError } from "../ops/config-validation.js";
 import { AntChallengeStore, type AntAdminContext } from "../api/ant-admin.js";
 import { registerAntAdminRoutes } from "../api/routes.js";
 import { RateLimiter } from "../api/rate-limit.js";
+import { makeSlackNotifier } from "../ops/slack.js";
 
 export type AntAdminBoot =
   | { enabled: false; reason: string }
@@ -99,8 +100,12 @@ export async function buildAntAdminContext(db: Db, env: NodeJS.ProcessEnv = proc
     requireApproval: config.antRequiresApproval ?? false,
     includeMemo: (env.ANT_INCLUDE_MEMO ?? "true") !== "false",
     challengeStore: new AntChallengeStore(),
+    network: config.network,
     log: (msg, extra) => console.log(JSON.stringify({ msg, ...extra })), // eslint-disable-line no-console
     alert: (a) => console.error(JSON.stringify({ msg: "ALERT", ...a })), // eslint-disable-line no-console
+    // Opt-in Slack notifier (no-op unless SLACK_WEBHOOK_URL is set). Fire-and-forget:
+    // a Slack outage can never block or break ANT submission.
+    slackNotify: makeSlackNotifier(config.slackWebhookUrl, (m, meta) => console.log(JSON.stringify({ msg: m, meta }))), // eslint-disable-line no-console
   };
 }
 

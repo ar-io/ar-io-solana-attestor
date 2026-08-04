@@ -15,8 +15,11 @@ import { DispatchWorker } from "../dispatch/worker.js";
 import { assertSingleConfirmRpc, loadDispatchConfig, loadSignerRegistry } from "../dispatch/dispatch-config.js";
 import { assertVaultDurationsMatchChain, fetchArioConfigVaultDurations } from "../dispatch/ario-config.js";
 import { assertBootConfig } from "../ops/config-validation.js";
-import { collectMetrics } from "../ops/metrics.js";
+import { collectMetrics, type MetricsExtras } from "../ops/metrics.js";
 import { evaluateAlerts, loadAlertThresholds } from "../ops/alerts.js";
+import { makeSlackNotifier } from "../ops/slack.js";
+import { SlackAlertRouter } from "../ops/alert-slack.js";
+import { DEFAULT_SOL_LOW_THRESHOLD_LAMPORTS } from "../config.js";
 import type { FloatStatus } from "../dispatch/float.js";
 
 async function main(): Promise<void> {
@@ -68,20 +71,47 @@ async function main(): Promise<void> {
   const signers = await loadSignerRegistry();
   const float = new FloatManager(dispatch.floatPolicy);
   const alertThresholds = loadAlertThresholds();
+  const solLowThresholdLamports = config.solLowThresholdLamports ?? DEFAULT_SOL_LOW_THRESHOLD_LAMPORTS;
 
-  /** Emit every firing alert as a severity-tagged structured log line. */
-  async function emitAlerts(floatStatus: FloatStatus): Promise<void> {
+  // Opt-in Slack routing (no-op when SLACK_WEBHOOK_URL is unset). ONE router for
+  // the whole worker run so the in-memory de-dup spans ticks — a persistent
+  // balance-low condition posts once, then at most once per ~30 min (see
+  // alert-slack.ts). Fire-and-forget: a Slack problem can never touch dispatch.
+  const slackNotify = makeSlackNotifier(
+    config.slackWebhookUrl,
+    // eslint-disable-next-line no-console
+    (m, meta) => console.warn(JSON.stringify({ msg: m, meta })),
+  );
+  const slackRouter = new SlackAlertRouter({ notify: slackNotify });
+
+  /** Emit every firing alert as a severity-tagged structured log line + (opt-in) Slack. */
+  async function emitAlerts(floatStatus: FloatStatus): Promise<number> {
     try {
-      const snapshot = await collectMetrics(db.pool, { float: floatStatus });
-      for (const a of evaluateAlerts(snapshot, alertThresholds)) {
+      const extras: MetricsExtras = { float: floatStatus };
+      // Hot dispenser (fee-payer) native SOL. Guarded independently so a transient
+      // RPC blip on this read never fires a false SOL-low critical and never drops
+      // the other alerts — we simply skip the SOL check for this tick.
+      try {
+        const balanceLamports = await gateway.getSolBalance(signers.token.address);
+        extras.dispenserSol = { balanceLamports, thresholdLamports: solLowThresholdLamports };
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn(JSON.stringify({ msg: "sol balance read failed (skipping sol-low check)", err: (e as Error).message }));
+      }
+      const snapshot = await collectMetrics(db.pool, extras);
+      const alerts = evaluateAlerts(snapshot, alertThresholds);
+      for (const a of alerts) {
         const line = JSON.stringify({ msg: "ALERT", alert: a.name, severity: a.severity, value: a.value, threshold: a.threshold, detail: a.message });
         // eslint-disable-next-line no-console
         if (a.severity === "critical") console.error(line);
         else console.warn(line);
       }
+      // ADDITIVE to journald: post warning+critical alerts to Slack (de-duped).
+      return slackRouter.post(alerts).length;
     } catch (e) {
       // eslint-disable-next-line no-console
       console.error(JSON.stringify({ msg: "alert eval error", err: (e as Error).message }));
+      return 0;
     }
   }
 
@@ -129,7 +159,12 @@ async function main(): Promise<void> {
       }
       // Evaluate + emit ops alerts each tick (float-low, reconciliation drift,
       // dispatch-failure, big-claim-queue, anchor-failure, ...).
-      await emitAlerts(status);
+      const posted = await emitAlerts(status);
+      // In `--once` mode this is a short-lived process: the Slack POSTs are
+      // fire-and-forget, so give them a bounded moment to flush before the process
+      // exits (the persistent-loop mode keeps running, so its POSTs flush naturally).
+      // Mirrors the ops-metrics CLI drain.
+      if (once && posted > 0 && config.slackWebhookUrl) await sleep(6000);
     } catch (e) {
       // eslint-disable-next-line no-console
       console.error(JSON.stringify({ msg: "tick error", err: (e as Error).message }));

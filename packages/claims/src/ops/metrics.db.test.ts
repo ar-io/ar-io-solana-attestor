@@ -82,7 +82,7 @@ describe("ops metrics collector (DB)", { skip: !HAS_DB }, () => {
 
   it("collectMetrics folds in optional float + reserves blocks", async () => {
     const m = await collectMetrics(db.pool, {
-      float: { balanceMario: 300_000n * ONE_TOKEN, reservedMario: 0n, availableMario: 300_000n * ONE_TOKEN, capMario: 500_000n * ONE_TOKEN, refillNeeded: false, overCap: false },
+      float: { balanceMario: 300_000n * ONE_TOKEN, reservedMario: 0n, availableMario: 300_000n * ONE_TOKEN, capMario: 500_000n * ONE_TOKEN, refillThresholdMario: 100_000n * ONE_TOKEN, refillNeeded: false, overCap: false },
       reserves: {
         network: "solana-mainnet", generatedAt: new Date().toISOString(), mint: "M",
         reserves: { hotDispenser: "H", hotFloatMario: "1", coldReserve: null, coldReserveMario: "0", totalReserveMario: "1", antHoldings: null },
@@ -96,7 +96,7 @@ describe("ops metrics collector (DB)", { skip: !HAS_DB }, () => {
 
   it("renderPrometheus emits the expected metric families", async () => {
     const m = await collectMetrics(db.pool, {
-      float: { balanceMario: 300_000n * ONE_TOKEN, reservedMario: 0n, availableMario: 250_000n * ONE_TOKEN, capMario: 500_000n * ONE_TOKEN, refillNeeded: false, overCap: false },
+      float: { balanceMario: 300_000n * ONE_TOKEN, reservedMario: 0n, availableMario: 250_000n * ONE_TOKEN, capMario: 500_000n * ONE_TOKEN, refillThresholdMario: 100_000n * ONE_TOKEN, refillNeeded: false, overCap: false },
     });
     const text = renderPrometheus(m);
     for (const name of ["claims_up", "claims_by_status", "claims_dispatch_confirmed_total", "claims_dispatch_drift_mario", "claims_review_queue_depth", "claims_outstanding_ario", "claims_float_available_ario"]) {

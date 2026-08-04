@@ -14,6 +14,10 @@ import { createRpc } from "../solana.js";
 import { SolanaChainGateway } from "../dispatch/chain.js";
 import { loadTransparencyConfig } from "../transparency/config.js";
 import { getMetricsPrometheus, getMetricsResult, type MetricsDeps } from "../api/metrics.js";
+import { makeSlackNotifier } from "../ops/slack.js";
+import { SlackAlertRouter } from "../ops/alert-slack.js";
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -44,6 +48,22 @@ async function main(): Promise<void> {
       if (a.severity === "critical") console.error(line);
       else console.warn(line);
     }
+
+    // Opt-in Slack (no-op when SLACK_WEBHOOK_URL is unset). A FRESH router per run
+    // => each firing warning/critical posts once this invocation (fine for a
+    // one-shot; the in-loop worker is what needs cross-tick de-dup). Fire-and-forget.
+    const slackNotify = makeSlackNotifier(
+      config.slackWebhookUrl,
+      // eslint-disable-next-line no-console
+      (m, meta) => console.warn(JSON.stringify({ msg: m, meta })),
+    );
+    const posted = new SlackAlertRouter({ notify: slackNotify }).post(alerts);
+    if (config.slackWebhookUrl && posted.length > 0) {
+      // The POSTs are detached (never awaited on principle). This CLI is NOT the
+      // money path, so give the webhook a bounded moment to flush before we exit.
+      await sleep(6000);
+    }
+
     if (alertLevel === "critical") process.exitCode = 2;
   } finally {
     await db.close();
