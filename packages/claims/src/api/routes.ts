@@ -130,21 +130,46 @@ function marioToArioStr(mario: string): string {
   return frac ? `${whole}.${frac}` : `${whole}`;
 }
 
-/** Operator-readable Slack line for a claim that just landed in `pending_review`
- *  (fully-manual posture: the operator must `dispatch:approve` it). Pure. */
-export function composePendingReviewSlackMessage(res: {
+/** Fields the pending-review notification renders (read from claims⋈assets⋈recipients). */
+export interface PendingReviewClaim {
   claimId: string;
-  assetKey: string;
-  claimant: string;
-  settlement: string | null;
-}): { text: string } {
-  const amount = res.settlement ? ` ${marioToArioStr(res.settlement)} ARIO` : "";
-  const asset = res.assetKey.length > 14 ? `${res.assetKey.slice(0, 6)}…${res.assetKey.slice(-4)}` : res.assetKey;
-  const to = res.claimant.length > 12 ? `${res.claimant.slice(0, 4)}…${res.claimant.slice(-4)}` : res.claimant;
+  assetType: string; // 'token' | 'vault' | 'ant'
+  amountMario: string | null; // token/vault mARIO; null for ANT
+  antName: string | null; // ArNS name (ANT), if resolved
+  antMint: string | null; // ANT mint
+  claimant: string; // Solana destination (full)
+  protocol: number; // 0 arweave, 1 ethereum
+  sourceAddress: string; // the identity that proved ownership
+}
+
+/** Operator-readable Slack message for a claim that just landed in `pending_review`
+ *  (fully-manual posture: the operator must `dispatch:approve` it). Pure — shows the
+ *  asset TYPE, the ARIO amount (token/vault) or ArNS name/mint (ANT), the FULL
+ *  destination, and who proved ownership, so the operator can act without a lookup. */
+export function composePendingReviewSlackMessage(c: PendingReviewClaim): { text: string } {
+  const proto = c.protocol === 1 ? "Ethereum" : "Arweave";
+  const src = c.sourceAddress.length > 16 ? `${c.sourceAddress.slice(0, 8)}…${c.sourceAddress.slice(-6)}` : c.sourceAddress;
+  let what: string;
+  let extra = "";
+  if (c.assetType === "ant") {
+    const id = c.antName
+      ? `ArNS “${c.antName}”`
+      : c.antMint
+        ? `mint ${c.antMint.slice(0, 6)}…${c.antMint.slice(-4)}`
+        : "ANT";
+    what = `ANT — ${id}`;
+    extra = " — then build + sign the batch in /admin";
+  } else {
+    const amt = c.amountMario ? `${marioToArioStr(c.amountMario)} ARIO` : "(amount n/a)";
+    what = `${c.assetType === "vault" ? "Vault" : "Token"} — ${amt}`;
+  }
   return {
     text:
-      `🟡 New claim awaiting approval — claim ${res.claimId.slice(0, 8)} · asset ${asset}${amount} → ${to}. ` +
-      `Approve: \`dispatch:approve ${res.claimId}\``,
+      `🟡 New claim awaiting approval\n` +
+      `• ${what}\n` +
+      `• To: ${c.claimant}\n` +
+      `• From: ${src} (${proto})\n` +
+      `• Approve: \`dispatch:approve ${c.claimId}\`${extra}`,
   };
 }
 
@@ -228,10 +253,37 @@ export function registerClaimsRoutes(app: FastifyInstance, deps: ClaimsRoutesDep
       // 202 Accepted: verified + queued for M4 dispatch (or pending_review).
       reply.code(202).send(res);
       // Decoupled from the response: ping the operator when a claim needs manual
-      // approval. Never awaited; the notifier swallows all errors (a Slack outage
-      // can't affect the claim). Only fires on pending_review, not auto-dispatch.
+      // approval. Never awaited; the DB read + notifier swallow all errors (a Slack
+      // outage / read error can't affect the claim). Only fires on pending_review.
       if (res.status === "pending_review") {
-        claimSlackNotify(composePendingReviewSlackMessage(res));
+        void (async () => {
+          const r = await pool.query<{
+            asset_type: string; amount: string | null; ant_name: string | null;
+            ant_mint: string | null; claimant: string; protocol: number; source_address: string;
+          }>(
+            `SELECT a.asset_type, a.amount::text AS amount, a.ant_name, a.ant_mint,
+                    c.claimant, rc.protocol, rc.source_address
+               FROM claims c
+               JOIN assets a ON a.asset_key = c.asset_key
+               JOIN recipients rc ON rc.recipient_id = a.recipient_id
+              WHERE c.claim_id = $1`,
+            [res.claimId],
+          );
+          const row = r.rows[0];
+          if (!row) return;
+          claimSlackNotify(
+            composePendingReviewSlackMessage({
+              claimId: res.claimId,
+              assetType: row.asset_type,
+              amountMario: row.amount,
+              antName: row.ant_name,
+              antMint: row.ant_mint,
+              claimant: row.claimant,
+              protocol: row.protocol,
+              sourceAddress: row.source_address,
+            }),
+          );
+        })().catch((err) => app.log.warn({ err }, "pending-review slack notify failed"));
       }
     } catch (e) {
       sendApiError(reply, e);
