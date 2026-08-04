@@ -60,11 +60,17 @@ export async function readLiabilities(pool: Pool, scope?: AssetScope): Promise<L
     claimed_ants: string;
     total_ants: string;
   }>(
+    // OUTSTANDING excludes `manual_review` (AT-RISK): those assets are hidden (404),
+    // never self-served, and delivered out-of-band only after manual identity proof —
+    // so they are NOT a liability the hot/cold custody float must cover. Counting them
+    // would report a false reserves shortfall for assets no claimant can exercise via
+    // the service. `total_*` still counts them (full-ledger view); only the coverage-
+    // relevant OUTSTANDING figures scope to the deliverable/self-serve set.
     `SELECT
-       COALESCE(SUM(amount) FILTER (WHERE asset_type IN ('token','vault') AND status NOT IN ('claimed','cancelled')),0)::text AS outstanding_mario,
+       COALESCE(SUM(amount) FILTER (WHERE asset_type IN ('token','vault') AND status NOT IN ('claimed','cancelled','manual_review')),0)::text AS outstanding_mario,
        COALESCE(SUM(amount) FILTER (WHERE asset_type IN ('token','vault') AND status = 'claimed'),0)::text AS claimed_mario,
        COALESCE(SUM(amount) FILTER (WHERE asset_type IN ('token','vault') AND status <> 'cancelled'),0)::text AS total_mario,
-       count(*) FILTER (WHERE asset_type = 'ant' AND status NOT IN ('claimed','cancelled'))::text AS outstanding_ants,
+       count(*) FILTER (WHERE asset_type = 'ant' AND status NOT IN ('claimed','cancelled','manual_review'))::text AS outstanding_ants,
        count(*) FILTER (WHERE asset_type = 'ant' AND status = 'claimed')::text AS claimed_ants,
        count(*) FILTER (WHERE asset_type = 'ant' AND status <> 'cancelled')::text AS total_ants
      FROM assets
