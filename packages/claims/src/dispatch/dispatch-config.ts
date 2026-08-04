@@ -117,6 +117,17 @@ export async function loadSigner(role: SignerRole, env: NodeJS.ProcessEnv = proc
 export async function loadSignerRegistry(env: NodeJS.ProcessEnv = process.env): Promise<SignerRegistry> {
   const token = await loadSigner("token", env);
   if (!token) throw new Error("no treasury (token) signer configured — set TREASURY_KEY_SEALED_PATH + TREASURY_KEY_PASSPHRASE");
+  // The worker signs dispenses with this unsealed key, while the API/metrics read
+  // balances of TREASURY_ADDRESS. If they diverge a mismatch is SILENT — you'd fund
+  // an address the worker can't spend from. Assert they match at boot (refuse to
+  // start otherwise). TREASURY_ADDRESS is optional in tests/localnet; when set it MUST equal.
+  const expectedTreasury = env.TREASURY_ADDRESS?.trim();
+  if (expectedTreasury && token.address !== expectedTreasury) {
+    throw new Error(
+      `treasury signer address ${token.address} does NOT equal the configured TREASURY_ADDRESS ${expectedTreasury} — ` +
+        `the unsealed key does not control the funding address. Refusing to start (would dispense from / report reserves on mismatched accounts).`,
+    );
+  }
   // ANT custody is OPERATOR-SUPPLIED per approval batch (loadColdAntSigner), NOT a
   // persistent server key. A persistent `ant` signer is loaded ONLY if a
   // deployment explicitly opts in via ANT_SIGNER_* (production does NOT).
