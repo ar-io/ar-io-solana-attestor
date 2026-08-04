@@ -52,6 +52,7 @@ import {
   type AntSubmitResult,
 } from "../dispatch/ant-operator.js";
 import type { Network } from "../config.js";
+import { makeSlackNotifier } from "../ops/slack.js";
 
 export interface ClaimsRoutesDeps {
   config: Config;
@@ -120,9 +121,44 @@ function enforceMetricsAccess(config: Config, req: FastifyRequest): void {
   );
 }
 
+/** Format integer mARIO as a human ARIO decimal string (trailing zeros trimmed). */
+function marioToArioStr(mario: string): string {
+  const ONE = 1_000_000n;
+  const m = BigInt(mario);
+  const whole = m / ONE;
+  const frac = (m % ONE).toString().padStart(6, "0").replace(/0+$/, "");
+  return frac ? `${whole}.${frac}` : `${whole}`;
+}
+
+/** Operator-readable Slack line for a claim that just landed in `pending_review`
+ *  (fully-manual posture: the operator must `dispatch:approve` it). Pure. */
+export function composePendingReviewSlackMessage(res: {
+  claimId: string;
+  assetKey: string;
+  claimant: string;
+  settlement: string | null;
+}): { text: string } {
+  const amount = res.settlement ? ` ${marioToArioStr(res.settlement)} ARIO` : "";
+  const asset = res.assetKey.length > 14 ? `${res.assetKey.slice(0, 6)}…${res.assetKey.slice(-4)}` : res.assetKey;
+  const to = res.claimant.length > 12 ? `${res.claimant.slice(0, 4)}…${res.claimant.slice(-4)}` : res.claimant;
+  return {
+    text:
+      `🟡 New claim awaiting approval — claim ${res.claimId.slice(0, 8)} · asset ${asset}${amount} → ${to}. ` +
+      `Approve: \`dispatch:approve ${res.claimId}\``,
+  };
+}
+
 export function registerClaimsRoutes(app: FastifyInstance, deps: ClaimsRoutesDeps): void {
   const { config, db, limiters, antAdmin } = deps;
   const pool = db.pool;
+  // Opt-in Slack: notify the operator the instant a claim lands in `pending_review`
+  // (fully-manual posture needs this — otherwise claims wait unseen). No-op when
+  // SLACK_WEBHOOK_URL is unset; fire-and-forget, never blocks/breaks the response.
+  const claimSlackNotify = makeSlackNotifier(
+    config.slackWebhookUrl,
+    // eslint-disable-next-line no-console
+    (m, meta) => console.warn(JSON.stringify({ msg: m, meta })),
+  );
 
   // CORS — permissive like the attestor (public claim API). Preflight short-circuit.
   // The admin READ routes carry `x-ant-read-token`; expose it (and `authorization`)
@@ -191,6 +227,12 @@ export function registerClaimsRoutes(app: FastifyInstance, deps: ClaimsRoutesDep
       const res = await completeClaim(pool, config, body);
       // 202 Accepted: verified + queued for M4 dispatch (or pending_review).
       reply.code(202).send(res);
+      // Decoupled from the response: ping the operator when a claim needs manual
+      // approval. Never awaited; the notifier swallows all errors (a Slack outage
+      // can't affect the claim). Only fires on pending_review, not auto-dispatch.
+      if (res.status === "pending_review") {
+        claimSlackNotify(composePendingReviewSlackMessage(res));
+      }
     } catch (e) {
       sendApiError(reply, e);
     }
