@@ -43,6 +43,9 @@ class MapGateway implements ChainGateway {
   async accountExists(): Promise<boolean> {
     return true;
   }
+  async getAccountData(): Promise<Uint8Array | null> {
+    return null;
+  }
   async getBlockHeight(): Promise<bigint> {
     return 1n;
   }

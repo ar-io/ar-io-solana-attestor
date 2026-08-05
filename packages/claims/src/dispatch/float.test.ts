@@ -49,6 +49,7 @@ describe("FloatManager.status", () => {
       getTokenBalance: async () => balance,
       getSolBalance: async () => 0n,
       accountExists: async () => true,
+      getAccountData: async () => null,
       getBlockHeight: async () => 1000n,
       signTransaction: async () => { throw new Error("unused"); },
       broadcast: async () => {},

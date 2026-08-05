@@ -304,6 +304,7 @@ describe("M6 UAT — reserves false-surplus", { skip: !HAS_DB }, () => {
     async getTokenBalance(a: Address): Promise<bigint> { return this.bal.get(a as string) ?? 0n; }
     async getSolBalance(): Promise<bigint> { return 0n; }
     async accountExists(): Promise<boolean> { return true; }
+    async getAccountData(): Promise<Uint8Array | null> { return null; }
     async getBlockHeight(): Promise<bigint> { return 1n; }
     async signTransaction(): Promise<never> { throw new Error("unused"); }
     async broadcast(): Promise<void> {}

@@ -79,6 +79,7 @@ import {
   mplCoreUpdateAuthorityIx,
   transferTokensIx,
 } from "./instructions.js";
+import { buildVaultRelockIxs } from "./vault-relock.js";
 
 export interface VaultDurations {
   minVaultDuration: bigint;
@@ -463,19 +464,33 @@ export class DispatchWorker {
         return { claimId, assetKey: asset.asset_key, outcome: "awaiting_manual_vault_delivery", detail: `vault settlement anomaly: ${(e as Error).message}` };
       }
       if (settlement.kind === "relock") {
-        // ADVERSARIAL ITEM V — a still-locked vault claim is NOT auto-relocked via
-        // a CPI and must NOT loop in `pending_review`. Route it to the MANUAL
-        // operator delivery queue with the CORRECT ABSOLUTE unlock timestamp (==
-        // the escrow's original vault_end_timestamp). The operator hand-delivers a
-        // "transfer tokens locked" to that end date; if it has since passed by the
-        // time the operator acts, the queue report flags deliver-UNLOCKED (liquid).
-        await this.#routeToManualVaultDelivery(
-          claimId, asset.asset_key, settlement.unlockTimestamp, settlement.lockDurationSeconds,
-        );
-        return { claimId, assetKey: asset.asset_key, outcome: "awaiting_manual_vault_delivery", detail: "vault relock -> manual delivery" };
+        // Faithful re-lock (ADR-027): deliver a LOCKED Solana vault preserving the
+        // claimant's original unlock date via ario-core `vaulted_transfer`
+        // (treasury-signed, non-revocable). The vault's token account is NOT init
+        // in the program, so buildVaultRelockIxs pre-creates it + reads the
+        // recipient's live VaultCounter.next_id. Verified vs the deployed program
+        // and mainnet-simulated. Falls back to the manual queue only if ario-core
+        // isn't configured (never silently drops the claim).
+        if (!this.#d.arioCoreProgram) {
+          await this.#routeToManualVaultDelivery(claimId, asset.asset_key, settlement.unlockTimestamp, settlement.lockDurationSeconds);
+          return { claimId, assetKey: asset.asset_key, outcome: "awaiting_manual_vault_delivery", detail: "relock: ARIO_CORE_PROGRAM unset" };
+        }
+        const built = await buildVaultRelockIxs({
+          readAccount: (a) => this.#d.gateway.getAccountData(a),
+          arioCoreProgram: this.#d.arioCoreProgram,
+          mint: this.#d.mint,
+          sender: hotSigner.address,
+          claimant,
+          amount,
+          lockDurationSeconds: settlement.lockDurationSeconds,
+          memoIxs: this.#memoIxs(claimId),
+        });
+        ixs = built.ixs;
+        settlementLabel = `relock:${settlement.lockDurationSeconds}s`;
+      } else {
+        settlementLabel = `liquid:${settlement.reason}`;
+        ixs = await this.#buildTokenIxs(claimId, hotSigner, claimant, amount);
       }
-      settlementLabel = `liquid:${settlement.reason}`;
-      ixs = await this.#buildTokenIxs(claimId, hotSigner, claimant, amount);
     } else {
       settlementLabel = "token";
       ixs = await this.#buildTokenIxs(claimId, hotSigner, claimant, amount);
