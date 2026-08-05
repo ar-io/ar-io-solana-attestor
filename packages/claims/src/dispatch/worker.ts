@@ -585,10 +585,16 @@ export class DispatchWorker {
       const r = await client.query<{ status: string }>("SELECT status FROM claims WHERE claim_id = $1 FOR UPDATE", [claimId]);
       const row = r.rows[0];
       if (!row) throw new Error(`no such claim ${claimId}`);
-      if (row.status !== "pending_review") throw new Error(`claim ${claimId} is ${row.status}, not pending_review`);
+      // Approvable = pending_review (the brake) OR verified (ready but, under
+      // ANT_REQUIRES_APPROVAL, gated behind an explicit operator approval). Setting
+      // approved_at on a verified TOKEN claim is a harmless no-op (it auto-dispatches
+      // regardless); on a verified ANT it makes it batch-eligible in /admin.
+      if (row.status !== "pending_review" && row.status !== "verified") {
+        throw new Error(`claim ${claimId} is ${row.status}, not approvable (must be verified or pending_review)`);
+      }
       await client.query("UPDATE claims SET approved_at = now(), approved_by = $2, updated_at = now() WHERE claim_id = $1", [claimId, approvedBy]);
       const a = await client.query<{ asset_key: string }>("SELECT asset_key FROM claims WHERE claim_id = $1", [claimId]);
-      await appendAudit(client, { event: "claim.approved", claimId, assetKey: a.rows[0]?.asset_key, status: "pending_review", detail: { approvedBy } });
+      await appendAudit(client, { event: "claim.approved", claimId, assetKey: a.rows[0]?.asset_key, status: row.status, detail: { approvedBy } });
       await client.query("COMMIT");
     } catch (e) {
       await client.query("ROLLBACK").catch(() => {});
