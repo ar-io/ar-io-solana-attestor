@@ -22,6 +22,9 @@ import { composeDispensedSlackMessage } from "../ops/claim-format.js";
 import { SlackAlertRouter } from "../ops/alert-slack.js";
 import { DEFAULT_SOL_LOW_THRESHOLD_LAMPORTS } from "../config.js";
 import type { FloatStatus } from "../dispatch/float.js";
+import { AntAclHealer, makeHealOne } from "../dispatch/ant-acl-healer.js";
+import { ARIO_ANT_PROGRAM_MAINNET, ARIO_ANT_PROGRAM_DEVNET } from "../dispatch/ant-acl-instructions.js";
+import { address } from "@solana/kit";
 
 async function main(): Promise<void> {
   // Fail FAST on a worker misconfig (pooled CONFIRM RPC would break exactly-once;
@@ -86,9 +89,13 @@ async function main(): Promise<void> {
   const slackRouter = new SlackAlertRouter({ notify: slackNotify });
 
   /** Emit every firing alert as a severity-tagged structured log line + (opt-in) Slack. */
-  async function emitAlerts(floatStatus: FloatStatus): Promise<number> {
+  async function emitAlerts(floatStatus?: FloatStatus): Promise<number> {
     try {
-      const extras: MetricsExtras = { float: floatStatus };
+      // float omitted when its balance read failed this tick — evaluateAlerts
+      // guards float-low on `s.float`, so a transient RPC blip no longer fires a
+      // false "0 ARIO" alert; the other (DB-derived) alerts still evaluate.
+      const extras: MetricsExtras = {};
+      if (floatStatus) extras.float = floatStatus;
       // Hot dispenser (fee-payer) native SOL. Guarded independently so a transient
       // RPC blip on this read never fires a false SOL-low critical and never drops
       // the other alerts — we simply skip the SOL check for this tick.
@@ -141,6 +148,32 @@ async function main(): Promise<void> {
     hotAta,
   }));
 
+  // ANT ACL auto-heal: our raw-transfer ANT dispatch moves the MPL Core asset
+  // but bypasses the ario-ant ACL, so arns.app keeps showing the OLD owner until
+  // reconciled. This sweep heals confirmed ANT claims in-process — permissionless,
+  // treasury-paid, idempotent, and fully off the money path. Gated to
+  // mainnet/devnet with ANT_COLD_ADDRESS set; disable via ANT_ACL_HEAL=off.
+  const aclHealBatch = Math.max(1, parseInt(process.env.ANT_ACL_HEAL_BATCH ?? "2", 10) || 2);
+  const antProgram =
+    config.network === "solana-mainnet" ? ARIO_ANT_PROGRAM_MAINNET : config.network === "solana-devnet" ? ARIO_ANT_PROGRAM_DEVNET : undefined;
+  let healer: AntAclHealer | undefined;
+  if ((process.env.ANT_ACL_HEAL ?? "on") !== "off" && antProgram && config.antColdAddress) {
+    healer = new AntAclHealer({
+      pool: db.pool,
+      antProgram,
+      oldOwner: address(config.antColdAddress),
+      treasuryAddress: signers.token.address,
+      healOne: makeHealOne(createRpc(dispatch.confirmRpcUrl), gateway, await signers.token.getSigner()),
+      log: (msg, extra) => console.log(JSON.stringify({ msg, ...extra })), // eslint-disable-line no-console
+      alert: (a) => console.warn(JSON.stringify({ msg: "ALERT", alert: a.name, severity: a.severity, detail: a.message, claimId: a.claimId })), // eslint-disable-line no-console
+    });
+    // eslint-disable-next-line no-console
+    console.log(JSON.stringify({ msg: "ant acl auto-heal enabled", antProgram, oldOwner: config.antColdAddress, batchPerTick: aclHealBatch }));
+  } else {
+    // eslint-disable-next-line no-console
+    console.log(JSON.stringify({ msg: "ant acl auto-heal disabled", network: config.network, hasOldOwner: !!config.antColdAddress }));
+  }
+
   const once = process.argv.includes("--once");
   let running = true;
   process.on("SIGINT", () => { running = false; });
@@ -190,8 +223,31 @@ async function main(): Promise<void> {
           })().catch((e) => console.warn(JSON.stringify({ msg: "dispensed notify failed", err: (e as Error).message })));
         }
       }
-      const status = await float.status(db.pool, gateway, hotAta);
-      if (status.refillNeeded) {
+      // ANT ACL auto-heal sweep — fully isolated: any failure here is logged and
+      // NEVER affects ARIO dispatch (the transfer already succeeded; this is a
+      // follow-up ArNS-ownership reconcile).
+      if (healer) {
+        try {
+          const hs = await healer.sweepOnce(aclHealBatch);
+          // eslint-disable-next-line no-console
+          if (hs.healed || hs.aborted || hs.failed) console.log(JSON.stringify({ msg: "ant acl heal sweep", ...hs }));
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.error(JSON.stringify({ msg: "ant acl heal sweep error", err: (e as Error).message }));
+        }
+      }
+
+      // Float balance read PROPAGATES transport errors (getTokenBalance) so a
+      // 429/blip never reads as an empty float. Skip only the float check this
+      // tick on failure — the other alerts + the heal sweep still run.
+      let status: FloatStatus | undefined;
+      try {
+        status = await float.status(db.pool, gateway, hotAta);
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn(JSON.stringify({ msg: "float balance read failed (skipping float check)", err: (e as Error).message }));
+      }
+      if (status?.refillNeeded) {
         // eslint-disable-next-line no-console
         console.warn(JSON.stringify({ msg: "REFILL NEEDED", available: status.availableMario.toString(), cap: status.capMario.toString() }));
       }

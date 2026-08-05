@@ -24,6 +24,7 @@
     "dispatch:ants": "tsx src/cli/dispatch-ants.ts",
     "admin:serve": "tsx src/cli/ant-admin-serve.ts",
     "dispatch:approve": "tsx src/cli/approve-claim.ts",
+    "reconcile:ant-acl": "tsx src/cli/reconcile-ant-acl.ts",
     "reconcile:dispatch": "tsx src/cli/reconcile-dispatch.ts",
     "vault:manual-queue": "tsx src/cli/vault-manual-queue.ts",
     "reap:challenges": "tsx src/cli/reap-challenges.ts",
