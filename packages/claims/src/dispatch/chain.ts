@@ -177,7 +177,15 @@ export class SolanaChainGateway implements ChainGateway {
     try {
       const res = await this.#rpc.getTokenAccountBalance(ata).send();
       return BigInt(res.value.amount);
-    } catch {
+    } catch (e) {
+      // A genuinely-absent ATA reads as 0 (no float yet). But a TRANSPORT blip
+      // (429/5xx/network/timeout) must PROPAGATE — otherwise a lagging RPC reads
+      // as an empty float and fires a false `float-low` critical (mirrors
+      // getSolBalance, which propagates for the same reason). Heuristic: HTTP /
+      // network errors carry these markers; the RPC "could not find account"
+      // error for a missing ATA does not.
+      const msg = (e as Error)?.message ?? "";
+      if (/HTTP error|\b429\b|Too Many Requests|fetch failed|ECONN|ETIMEDOUT|timed? ?out|\b5\d\d\b|socket hang up/i.test(msg)) throw e;
       return 0n; // account absent / not a token account
     }
   }
