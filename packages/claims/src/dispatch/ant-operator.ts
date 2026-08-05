@@ -198,7 +198,7 @@ export async function reserveAntBatch(pool: Pool, opts: ReserveAntBatchOpts): Pr
 
   const batchId = randomUUID();
   const statusPredicate = opts.requireApproval
-    ? "(c.status = 'pending_review' AND c.approved_at IS NOT NULL)"
+    ? "(c.status IN ('verified','pending_review') AND c.approved_at IS NOT NULL)"
     : "(c.status = 'verified' OR (c.status = 'pending_review' AND c.approved_at IS NOT NULL))";
 
   const items: AntReviewItem[] = [];
@@ -809,7 +809,7 @@ export interface AntPending {
 /** Count + sample of ANT claims awaiting dispatch (verified / approved). */
 export async function getAntPending(pool: Pool, opts: { requireApproval?: boolean; limit?: number } = {}): Promise<AntPending> {
   const statusPredicate = opts.requireApproval
-    ? "(c.status = 'pending_review' AND c.approved_at IS NOT NULL)"
+    ? "(c.status IN ('verified','pending_review') AND c.approved_at IS NOT NULL)"
     : "(c.status = 'verified' OR (c.status = 'pending_review' AND c.approved_at IS NOT NULL))";
   const r = await pool.query<{ claim_id: string; asset_key: string; ant_mint: string | null; ant_name: string | null; status: string; reserved: boolean; age: string }>(
     `SELECT c.claim_id, c.asset_key, a.ant_mint, a.ant_name, c.status,
