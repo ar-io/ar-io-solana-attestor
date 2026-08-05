@@ -53,6 +53,7 @@ import {
 } from "../dispatch/ant-operator.js";
 import type { Network } from "../config.js";
 import { makeSlackNotifier } from "../ops/slack.js";
+import { composePendingReviewSlackMessage } from "../ops/claim-format.js";
 
 export interface ClaimsRoutesDeps {
   config: Config;
@@ -119,58 +120,6 @@ function enforceMetricsAccess(config: Config, req: FastifyRequest): void {
     "METRICS_FORBIDDEN",
     "metrics are ops-only: set METRICS_AUTH_TOKEN (bearer) or expose them on a separate ops listener",
   );
-}
-
-/** Format integer mARIO as a human ARIO decimal string (trailing zeros trimmed). */
-function marioToArioStr(mario: string): string {
-  const ONE = 1_000_000n;
-  const m = BigInt(mario);
-  const whole = m / ONE;
-  const frac = (m % ONE).toString().padStart(6, "0").replace(/0+$/, "");
-  return frac ? `${whole}.${frac}` : `${whole}`;
-}
-
-/** Fields the pending-review notification renders (read from claims⋈assets⋈recipients). */
-export interface PendingReviewClaim {
-  claimId: string;
-  assetType: string; // 'token' | 'vault' | 'ant'
-  amountMario: string | null; // token/vault mARIO; null for ANT
-  antName: string | null; // ArNS name (ANT), if resolved
-  antMint: string | null; // ANT mint
-  claimant: string; // Solana destination (full)
-  protocol: number; // 0 arweave, 1 ethereum
-  sourceAddress: string; // the identity that proved ownership
-}
-
-/** Operator-readable Slack message for a claim that just landed in `pending_review`
- *  (fully-manual posture: the operator must `dispatch:approve` it). Pure — shows the
- *  asset TYPE, the ARIO amount (token/vault) or ArNS name/mint (ANT), the FULL
- *  destination, and who proved ownership, so the operator can act without a lookup. */
-export function composePendingReviewSlackMessage(c: PendingReviewClaim): { text: string } {
-  const proto = c.protocol === 1 ? "Ethereum" : "Arweave";
-  const src = c.sourceAddress.length > 16 ? `${c.sourceAddress.slice(0, 8)}…${c.sourceAddress.slice(-6)}` : c.sourceAddress;
-  let what: string;
-  let extra = "";
-  if (c.assetType === "ant") {
-    const id = c.antName
-      ? `ArNS “${c.antName}”`
-      : c.antMint
-        ? `mint ${c.antMint.slice(0, 6)}…${c.antMint.slice(-4)}`
-        : "ANT";
-    what = `ANT — ${id}`;
-    extra = " — then build + sign the batch in /admin";
-  } else {
-    const amt = c.amountMario ? `${marioToArioStr(c.amountMario)} ARIO` : "(amount n/a)";
-    what = `${c.assetType === "vault" ? "Vault" : "Token"} — ${amt}`;
-  }
-  return {
-    text:
-      `🟡 New claim awaiting approval\n` +
-      `• ${what}\n` +
-      `• To: ${c.claimant}\n` +
-      `• From: ${src} (${proto})\n` +
-      `• Approve: \`dispatch:approve ${c.claimId}\`${extra}`,
-  };
 }
 
 export function registerClaimsRoutes(app: FastifyInstance, deps: ClaimsRoutesDeps): void {
