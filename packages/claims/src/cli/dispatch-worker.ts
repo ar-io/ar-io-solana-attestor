@@ -18,6 +18,7 @@ import { assertBootConfig } from "../ops/config-validation.js";
 import { collectMetrics, type MetricsExtras } from "../ops/metrics.js";
 import { evaluateAlerts, loadAlertThresholds } from "../ops/alerts.js";
 import { makeSlackNotifier } from "../ops/slack.js";
+import { composeDispensedSlackMessage } from "../ops/claim-format.js";
 import { SlackAlertRouter } from "../ops/alert-slack.js";
 import { DEFAULT_SOL_LOW_THRESHOLD_LAMPORTS } from "../config.js";
 import type { FloatStatus } from "../dispatch/float.js";
@@ -152,6 +153,43 @@ async function main(): Promise<void> {
         // eslint-disable-next-line no-console
         console.log(JSON.stringify({ msg: "tick", processed: results.length, outcomes: tally(results.map((r) => r.outcome)) }));
       }
+      // Dispense-success Slack: one per claim that FRESHLY confirmed this tick
+      // (token/vault via the worker; ANT successes post from the /admin batch submit).
+      // Distinct per claim (no de-dup — each is a unique event); "already_confirmed"
+      // / "recovered_confirmed" are re-checks and never re-notify. Fire-and-forget.
+      let dispensedPosts = 0;
+      if (config.slackWebhookUrl) {
+        for (const res of results) {
+          if (res.outcome !== "confirmed" || !res.signature) continue;
+          dispensedPosts++;
+          const sig = res.signature;
+          void (async () => {
+            const r = await db.pool.query<{
+              asset_type: string; amount: string | null; ant_name: string | null; ant_mint: string | null;
+              claimant: string; protocol: number; source_address: string;
+            }>(
+              `SELECT a.asset_type, a.amount::text AS amount, a.ant_name, a.ant_mint,
+                      c.claimant, rc.protocol, rc.source_address
+                 FROM claims c JOIN assets a ON a.asset_key = c.asset_key
+                 JOIN recipients rc ON rc.recipient_id = a.recipient_id
+                WHERE c.claim_id = $1`,
+              [res.claimId],
+            );
+            const row = r.rows[0];
+            if (row) {
+              slackNotify(
+                composeDispensedSlackMessage(
+                  res.claimId,
+                  { assetType: row.asset_type, amountMario: row.amount, antName: row.ant_name, antMint: row.ant_mint, claimant: row.claimant, protocol: row.protocol, sourceAddress: row.source_address },
+                  sig,
+                  config.network,
+                ),
+              );
+            }
+            // eslint-disable-next-line no-console
+          })().catch((e) => console.warn(JSON.stringify({ msg: "dispensed notify failed", err: (e as Error).message })));
+        }
+      }
       const status = await float.status(db.pool, gateway, hotAta);
       if (status.refillNeeded) {
         // eslint-disable-next-line no-console
@@ -164,7 +202,7 @@ async function main(): Promise<void> {
       // fire-and-forget, so give them a bounded moment to flush before the process
       // exits (the persistent-loop mode keeps running, so its POSTs flush naturally).
       // Mirrors the ops-metrics CLI drain.
-      if (once && posted > 0 && config.slackWebhookUrl) await sleep(6000);
+      if (once && (posted > 0 || dispensedPosts > 0) && config.slackWebhookUrl) await sleep(6000);
     } catch (e) {
       // eslint-disable-next-line no-console
       console.error(JSON.stringify({ msg: "tick error", err: (e as Error).message }));
