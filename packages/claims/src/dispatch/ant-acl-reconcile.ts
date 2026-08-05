@@ -132,8 +132,12 @@ export function planAclHeal(s: AclHealSnapshot): AclHealPlan {
     actions.push(`record_acl_owner(new=${s.claimant}, page=${s.newOwnerAcl.targetPage.pageIdx})`);
   }
 
-  // 3. Reconcile AntConfig/AntControllers (idempotent; only when it has work).
-  const reconcileNeeded = s.controllers.length > 0 || s.lastKnownOwner !== s.claimant;
+  // 3. Reconcile AntConfig/AntControllers. `reconcile` only does anything while
+  //    `last_known_owner != owner` (it then clears controllers + updates the
+  //    owner). So it's needed when last_known_owner is still stale, or when the
+  //    OLD owner lingers as a controller. A controller that is the claimant is
+  //    healthy (their own name) and must NOT trigger a futile reconcile.
+  const reconcileNeeded = s.lastKnownOwner !== s.claimant || s.controllers.includes(s.oldOwner);
   if (reconcileNeeded) {
     ixs.push(
       arioAntReconcileIx({

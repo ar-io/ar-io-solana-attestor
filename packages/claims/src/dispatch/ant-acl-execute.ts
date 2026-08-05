@@ -187,7 +187,10 @@ export interface HealVerification {
   ownedByClaimant: boolean;
   oldEntryGone: boolean;
   newEntryPresent: boolean;
-  controllersCleared: boolean;
+  /** The OLD owner is not a lingering controller. A controller that IS the
+   *  claimant (their own name) is healthy and expected — `reconcile` only strips
+   *  the previous owner's delegated controllers, not the new owner's own. */
+  noStaleController: boolean;
   lastKnownOwnerOk: boolean;
   fullyHealed: boolean;
 }
@@ -199,11 +202,11 @@ export async function verifyHealed(rpc: SolanaRpc, p: HealParams): Promise<HealV
     ownedByClaimant: s.mplOwner === p.claimant,
     oldEntryGone: s.oldOwnerAcl.entryPage === null,
     newEntryPresent: s.newOwnerAcl.hasOwnerEntry,
-    controllersCleared: s.controllers.length === 0,
+    noStaleController: !s.controllers.includes(p.oldOwner),
     lastKnownOwnerOk: s.lastKnownOwner === p.claimant,
     fullyHealed: false,
   };
-  v.fullyHealed = v.ownedByClaimant && v.oldEntryGone && v.newEntryPresent && v.controllersCleared && v.lastKnownOwnerOk;
+  v.fullyHealed = v.ownedByClaimant && v.oldEntryGone && v.newEntryPresent && v.noStaleController && v.lastKnownOwnerOk;
   return v;
 }
 
