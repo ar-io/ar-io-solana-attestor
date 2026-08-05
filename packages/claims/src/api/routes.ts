@@ -406,7 +406,12 @@ export function composeAntSubmitSlackMessage(
       (meta?.antMint ? shortId(meta.antMint) : r.assetKey ? shortId(r.assetKey) : "unknown");
     const confirmed = ANT_CONFIRMED_OUTCOMES.has(r.outcome);
     if (confirmed && r.signature) {
-      return `• ${label} — ${r.outcome}  https://explorer.solana.com/tx/${r.signature}${clusterSuffix}`;
+      // Primary = the live ArNS name as a clickable <name>.ar.io link (resolves via
+      // the ar.io gateway on MAINNET; on devnet fall back to the plain label). Plus
+      // the Solana tx for the on-chain transfer.
+      const primary =
+        meta?.antName && network !== "solana-devnet" ? `https://${meta.antName}.ar.io` : label;
+      return `• ${primary} — ${r.outcome}  ·  tx: https://explorer.solana.com/tx/${r.signature}${clusterSuffix}`;
     }
     const detail = r.detail ? ` (${r.detail})` : "";
     return `• ⚠️ ${label} — ${r.outcome}${detail}`;
