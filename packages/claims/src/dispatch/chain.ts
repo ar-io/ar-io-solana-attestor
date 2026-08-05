@@ -123,6 +123,8 @@ export interface ChainGateway {
   getSolBalance(owner: Address): Promise<bigint>;
   /** Does the account exist on-chain? */
   accountExists(addr: Address): Promise<boolean>;
+  /** Raw account data (base64-decoded), or null if the account does not exist. */
+  getAccountData(addr: Address): Promise<Uint8Array | null>;
   /** Current block height (for blockhash-expiry checks). */
   getBlockHeight(): Promise<bigint>;
   /**
@@ -200,6 +202,11 @@ export class SolanaChainGateway implements ChainGateway {
   async accountExists(addr: Address): Promise<boolean> {
     const res = await this.#rpc.getAccountInfo(addr, { encoding: "base64" }).send();
     return res.value !== null;
+  }
+
+  async getAccountData(addr: Address): Promise<Uint8Array | null> {
+    const res = await this.#rpc.getAccountInfo(addr, { encoding: "base64" }).send();
+    return res.value ? new Uint8Array(Buffer.from(res.value.data[0], "base64")) : null;
   }
 
   async getBlockHeight(): Promise<bigint> {

@@ -72,6 +72,11 @@ export class FakeChainGateway implements ChainGateway {
     void _addr;
     return true;
   }
+  /** Test-injectable account data (keyed by address); default null (absent). */
+  accountData: Record<string, Uint8Array> = {};
+  async getAccountData(addr: Address): Promise<Uint8Array | null> {
+    return this.accountData[addr as string] ?? null;
+  }
   async getBlockHeight(): Promise<bigint> {
     return this.blockHeight;
   }
