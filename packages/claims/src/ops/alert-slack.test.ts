@@ -91,6 +91,56 @@ describe("SlackAlertRouter", () => {
     assert.equal(texts.length, 2);
   });
 
+  it("honors a per-alert repost override (float-low quiet for 12h, others unchanged)", () => {
+    let clock = 0;
+    const { notify, texts } = recordingNotifier();
+    const TWELVE_HOURS = 12 * 60 * 60 * 1000;
+    const router = new SlackAlertRouter({
+      notify,
+      now: () => clock,
+      repostIntervalMsByName: { "float-low": TWELVE_HOURS },
+    });
+
+    // Both post on first fire — an override never delays the FIRST notification.
+    assert.deepEqual(
+      router.post([alert("float-low", "warning"), alert("dispatch-stalled", "warning")]),
+      ["float-low", "dispatch-stalled"],
+    );
+
+    // Past the 30-min default: the un-overridden alert reposts, float-low stays quiet.
+    clock += DEFAULT_REPOST_INTERVAL_MS + 1;
+    assert.deepEqual(
+      router.post([alert("float-low", "warning"), alert("dispatch-stalled", "warning")]),
+      ["dispatch-stalled"],
+      "float-low is still inside its 12h window",
+    );
+
+    // Past 12h: float-low reposts too.
+    clock += TWELVE_HOURS;
+    assert.ok(router.post([alert("float-low", "warning")]).includes("float-low"));
+    assert.equal(texts.length, 4);
+  });
+
+  it("an overridden alert still re-posts at once after clearing and re-firing", () => {
+    let clock = 0;
+    const { notify } = recordingNotifier();
+    const router = new SlackAlertRouter({
+      notify,
+      now: () => clock,
+      repostIntervalMsByName: { "float-low": 12 * 60 * 60 * 1000 },
+    });
+
+    router.post([alert("float-low", "warning")]);
+    clock += 60_000;
+    router.post([]);                       // refilled -> condition clears
+    clock += 60_000;
+    assert.deepEqual(
+      router.post([alert("float-low", "warning")]),
+      ["float-low"],
+      "a genuinely NEW float-low is never muted by the long window",
+    );
+  });
+
   it("re-fires immediately after the condition clears and returns (memory reset)", () => {
     let clock = 0;
     const { notify, texts } = recordingNotifier();

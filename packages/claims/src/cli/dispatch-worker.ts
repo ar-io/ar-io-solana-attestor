@@ -86,7 +86,10 @@ async function main(): Promise<void> {
     // eslint-disable-next-line no-console
     (m, meta) => console.warn(JSON.stringify({ msg: m, meta })),
   );
-  const slackRouter = new SlackAlertRouter({ notify: slackNotify });
+  const slackRouter = new SlackAlertRouter({
+    notify: slackNotify,
+    repostIntervalMsByName: config.alertRepostOverridesMs,
+  });
 
   /** Emit every firing alert as a severity-tagged structured log line + (opt-in) Slack. */
   async function emitAlerts(floatStatus?: FloatStatus): Promise<number> {
