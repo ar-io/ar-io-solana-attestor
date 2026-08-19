@@ -3,7 +3,7 @@
 
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
-import { loadConfig, parseTrustProxy } from "./config.js";
+import { loadConfig, parseAlertRepostOverrides, parseTrustProxy } from "./config.js";
 
 const base: NodeJS.ProcessEnv = { NETWORK: "localnet" };
 
@@ -82,5 +82,29 @@ describe("loadConfig — metrics auth token (MEDIUM-4)", () => {
   });
   it("is carried through when set", () => {
     assert.equal(loadConfig({ ...base, METRICS_AUTH_TOKEN: "s3cret" }).metricsAuthToken, "s3cret");
+  });
+});
+
+describe("parseAlertRepostOverrides — Slack repost cadence knob", () => {
+  it("is undefined when unset or empty", () => {
+    assert.equal(parseAlertRepostOverrides(undefined), undefined);
+    assert.equal(parseAlertRepostOverrides("   "), undefined);
+    assert.equal(loadConfig(base).alertRepostOverridesMs, undefined);
+  });
+  it("parses s/m/h/d suffixes and bare milliseconds", () => {
+    assert.deepEqual(
+      parseAlertRepostOverrides("float-low=12h,dispatch-stalled=90s,a=5m,b=1d,c=250"),
+      { "float-low": 43_200_000, "dispatch-stalled": 90_000, a: 300_000, b: 86_400_000, c: 250 },
+    );
+  });
+  it("skips junk entries instead of throwing (a typo must not stop the worker booting)", () => {
+    assert.deepEqual(parseAlertRepostOverrides("float-low=12h,broken,x=,=5m,y=abc,z=0,w=-3h"), {
+      "float-low": 43_200_000,
+    });
+    assert.equal(parseAlertRepostOverrides("all,junk,here"), undefined);
+  });
+  it("is carried onto the config through ALERT_REPOST_OVERRIDES", () => {
+    const c = loadConfig({ ...base, ALERT_REPOST_OVERRIDES: "float-low=12h" });
+    assert.deepEqual(c.alertRepostOverridesMs, { "float-low": 43_200_000 });
   });
 });

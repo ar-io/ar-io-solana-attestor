@@ -12,7 +12,10 @@
 //! long-running worker shares ONE `SlackAlertRouter` whose in-memory map records
 //! the last time each alert NAME was posted:
 //!   * an alert is posted the FIRST time it fires, then
-//!   * at most once per `repostIntervalMs` (default 30 min) while it keeps firing,
+//!   * at most once per `repostIntervalMs` (default 30 min) while it keeps firing
+//!     — or per that alert's own entry in `repostIntervalMsByName`, which lets a
+//!     slow-moving operator chore (e.g. `float-low`, which needs a 4-eyes refill
+//!     and stays true for hours) repost far less often than a fast-moving one,
 //!   * and its memory is cleared as soon as it stops firing, so a later re-fire
 //!     posts immediately (not silenced by a stale timestamp).
 //! A stateless `ops:metrics` CLI run constructs a FRESH router, so it posts each
@@ -54,6 +57,13 @@ export interface SlackAlertRouterOptions {
   notify: SlackNotify;
   /** Minimum ms between reposts of the SAME still-firing alert (default 30 min). */
   repostIntervalMs?: number;
+  /**
+   * Per-alert-name overrides of `repostIntervalMs`, by exact alert name. An alert
+   * with no entry falls back to `repostIntervalMs`. Only the REPOST cadence is
+   * affected — every alert still posts immediately the first time it fires, and
+   * still clears when it stops firing, so nothing is ever silenced outright.
+   */
+  repostIntervalMsByName?: Readonly<Record<string, number>>;
   /** Injectable clock (tests). Defaults to `Date.now`. */
   now?: () => number;
 }
@@ -65,13 +75,23 @@ export interface SlackAlertRouterOptions {
 export class SlackAlertRouter {
   #notify: SlackNotify;
   #interval: number;
+  #intervalByName: Readonly<Record<string, number>>;
   #now: () => number;
   #lastPosted = new Map<string, number>();
 
   constructor(opts: SlackAlertRouterOptions) {
     this.#notify = opts.notify;
     this.#interval = opts.repostIntervalMs ?? DEFAULT_REPOST_INTERVAL_MS;
+    this.#intervalByName = opts.repostIntervalMsByName ?? {};
     this.#now = opts.now ?? (() => Date.now());
+  }
+
+  /** The repost quiet-window for one alert name (its override, else the default). */
+  #intervalFor(name: string): number {
+    const override = this.#intervalByName[name];
+    return typeof override === "number" && Number.isFinite(override) && override >= 0
+      ? override
+      : this.#interval;
   }
 
   /**
@@ -92,7 +112,7 @@ export class SlackAlertRouter {
     for (const a of alerts) {
       if (!isRoutableToSlack(a)) continue;
       const last = this.#lastPosted.get(a.name);
-      if (last !== undefined && now - last < this.#interval) continue; // still within the quiet window
+      if (last !== undefined && now - last < this.#intervalFor(a.name)) continue; // still within the quiet window
       this.#lastPosted.set(a.name, now);
       this.#notify({ text: formatSlackAlert(a) }); // fire-and-forget; never awaited
       posted.push(a.name);

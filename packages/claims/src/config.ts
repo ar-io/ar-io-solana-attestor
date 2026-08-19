@@ -86,6 +86,16 @@ export interface Config {
    * (0.5 SOL). Purely a monitoring signal — never gates the money path.
    */
   solLowThresholdLamports?: bigint;
+  /**
+   * Per-alert Slack REPOST cadence overrides, parsed from `ALERT_REPOST_OVERRIDES`
+   * (e.g. `float-low=12h,float-over-cap=6h`). Durations accept a plain ms number or
+   * an `s`/`m`/`h`/`d` suffix. Alerts with no entry keep the 30-min default.
+   *
+   * This tunes NOTIFICATION NOISE only: an alert still posts the instant it starts
+   * firing, still logs to journald every tick, and still clears when it resolves.
+   * It never changes whether an alert fires, and never touches the money path.
+   */
+  alertRepostOverridesMs?: Readonly<Record<string, number>>;
 }
 
 /** Default hot-dispenser SOL-low threshold: 0.5 SOL (1 SOL = 1e9 lamports). */
@@ -190,7 +200,35 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     antColdAddress: env.ANT_COLD_ADDRESS && env.ANT_COLD_ADDRESS.length > 0 ? env.ANT_COLD_ADDRESS : undefined,
     slackWebhookUrl: env.SLACK_WEBHOOK_URL && env.SLACK_WEBHOOK_URL.trim().length > 0 ? env.SLACK_WEBHOOK_URL.trim() : undefined,
     solLowThresholdLamports,
+    alertRepostOverridesMs: parseAlertRepostOverrides(env.ALERT_REPOST_OVERRIDES),
   };
+}
+
+/**
+ * Parse `ALERT_REPOST_OVERRIDES` — a comma-separated `<alert-name>=<duration>`
+ * list, where duration is bare milliseconds or a number with an `s`/`m`/`h`/`d`
+ * suffix (`float-low=12h,dispatch-stalled=90s`). Unparseable or non-positive
+ * entries are skipped rather than throwing: a typo in a monitoring knob must never
+ * stop the worker from booting. Returns undefined when nothing usable is set.
+ */
+export function parseAlertRepostOverrides(
+  raw: string | undefined,
+): Record<string, number> | undefined {
+  if (!raw || raw.trim().length === 0) return undefined;
+  const unit: Record<string, number> = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+  const out: Record<string, number> = {};
+  for (const part of raw.split(",")) {
+    const [rawName, rawValue] = part.split("=");
+    const name = rawName?.trim();
+    const value = rawValue?.trim();
+    if (!name || !value) continue;
+    const m = /^(\d+(?:\.\d+)?)([smhd])?$/.exec(value);
+    if (!m) continue;
+    const ms = Number(m[1]) * (m[2] ? unit[m[2]] : 1);
+    if (!Number.isFinite(ms) || ms <= 0) continue;
+    out[name] = Math.round(ms);
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**
