@@ -12,7 +12,7 @@ import { createRpc } from "../solana.js";
 import { SolanaChainGateway } from "../dispatch/chain.js";
 import { FloatManager } from "../dispatch/float.js";
 import { DispatchWorker } from "../dispatch/worker.js";
-import { assertSingleConfirmRpc, loadDispatchConfig, loadSignerRegistry } from "../dispatch/dispatch-config.js";
+import { assertSingleConfirmRpc, loadDispatchConfig, loadSignerRegistry, shouldMonitor } from "../dispatch/dispatch-config.js";
 import { assertVaultDurationsMatchChain, fetchArioConfigVaultDurations } from "../dispatch/ario-config.js";
 import { assertBootConfig } from "../ops/config-validation.js";
 import { collectMetrics, type MetricsExtras } from "../ops/metrics.js";
@@ -178,6 +178,10 @@ async function main(): Promise<void> {
   }
 
   const once = process.argv.includes("--once");
+  // -Infinity, not Date.now(): the first tick must monitor, so a worker that
+  // starts into a low float or an empty dispenser alerts immediately rather
+  // than after a monitor interval of silence.
+  let lastMonitorAt = Number.NEGATIVE_INFINITY;
   let running = true;
   process.on("SIGINT", () => { running = false; });
   process.on("SIGTERM", () => { running = false; });
@@ -240,23 +244,39 @@ async function main(): Promise<void> {
         }
       }
 
-      // Float balance read PROPAGATES transport errors (getTokenBalance) so a
-      // 429/blip never reads as an empty float. Skip only the float check this
-      // tick on failure — the other alerts + the heal sweep still run.
-      let status: FloatStatus | undefined;
-      try {
-        status = await float.status(db.pool, gateway, hotAta);
-      } catch (e) {
-        // eslint-disable-next-line no-console
-        console.warn(JSON.stringify({ msg: "float balance read failed (skipping float check)", err: (e as Error).message }));
+      // Monitoring runs on its own cadence, not every tick. The two balance
+      // reads below are the ONLY RPC an idle tick performs, so at the dispatch
+      // poll rate they cost ~34,500 calls/day to watch numbers that move
+      // slowly. They do not gate dispatch — the money path reads the live hot
+      // balance itself, immediately before it decides (worker.ts:
+      // `getTokenBalance` + `float.check`), so a stale reading here can never
+      // let a dispatch exceed the float. What throttling costs is alert
+      // latency, bounded by DISPATCH_MONITOR_INTERVAL_MS.
+      //
+      // `--once` always monitors: a single-shot run exists to report.
+      let posted = 0;
+      const now = Date.now();
+      if (shouldMonitor(now, lastMonitorAt, dispatch.monitorIntervalMs, once)) {
+        lastMonitorAt = now;
+
+        // Float balance read PROPAGATES transport errors (getTokenBalance) so a
+        // 429/blip never reads as an empty float. Skip only the float check this
+        // tick on failure — the other alerts + the heal sweep still run.
+        let status: FloatStatus | undefined;
+        try {
+          status = await float.status(db.pool, gateway, hotAta);
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.warn(JSON.stringify({ msg: "float balance read failed (skipping float check)", err: (e as Error).message }));
+        }
+        if (status?.refillNeeded) {
+          // eslint-disable-next-line no-console
+          console.warn(JSON.stringify({ msg: "REFILL NEEDED", available: status.availableMario.toString(), cap: status.capMario.toString() }));
+        }
+        // Evaluate + emit ops alerts (float-low, reconciliation drift,
+        // dispatch-failure, big-claim-queue, anchor-failure, ...).
+        posted = await emitAlerts(status);
       }
-      if (status?.refillNeeded) {
-        // eslint-disable-next-line no-console
-        console.warn(JSON.stringify({ msg: "REFILL NEEDED", available: status.availableMario.toString(), cap: status.capMario.toString() }));
-      }
-      // Evaluate + emit ops alerts each tick (float-low, reconciliation drift,
-      // dispatch-failure, big-claim-queue, anchor-failure, ...).
-      const posted = await emitAlerts(status);
       // In `--once` mode this is a short-lived process: the Slack POSTs are
       // fire-and-forget, so give them a bounded moment to flush before the process
       // exits (the persistent-loop mode keeps running, so its POSTs flush naturally).
