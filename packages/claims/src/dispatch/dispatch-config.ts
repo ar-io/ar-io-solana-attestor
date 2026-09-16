@@ -27,6 +27,21 @@ export interface DispatchConfig {
   antRequiresApproval: boolean;
   pollIntervalMs: number;
   /**
+   * How often the per-tick MONITORING reads run — the hot-float token balance
+   * and the dispenser's native SOL balance, which feed the ops alerts.
+   *
+   * Separate from `pollIntervalMs` on purpose. The dispatch poll must stay
+   * fast so a claim is picked up promptly, but those two balance reads are
+   * the only RPC an otherwise idle tick performs, so at a 5s poll they cost
+   * ~34,500 calls/day to watch numbers that move slowly. They do NOT gate
+   * dispatch: the money path reads the live hot balance itself, immediately
+   * before it decides (see worker.ts, `getTokenBalance` + `float.check`), so
+   * throttling here cannot let a dispatch exceed the float.
+   *
+   * The cost of raising it is alert latency, nothing else.
+   */
+  monitorIntervalMs: number;
+  /**
    * The RPC endpoint used for the exactly-once confirmation reads
    * (getSignatureStatuses + getBlockHeight). MUST be a SINGLE consistent
    * endpoint (or a read quorum), NOT a round-robin/load-balanced pool — a
@@ -35,6 +50,25 @@ export interface DispatchConfig {
    * requirements"). Defaults to CONFIRM_RPC_URL, then SOLANA_RPC_URL.
    */
   confirmRpcUrl: string;
+}
+
+/**
+ * Is this tick due to run the monitoring reads?
+ *
+ * Pure so the cadence is tested without a loop or a clock. `once` always
+ * monitors — a single-shot run exists to report — and a `lastMonitorAt` of
+ * `-Infinity` (the worker's initial value) always fires, so a worker starting
+ * into a low float alerts immediately rather than after an interval of
+ * silence.
+ */
+export function shouldMonitor(
+  now: number,
+  lastMonitorAt: number,
+  monitorIntervalMs: number,
+  once = false,
+): boolean {
+  if (once) return true;
+  return now - lastMonitorAt >= monitorIntervalMs;
 }
 
 /** Heuristic warn if the confirm RPC looks like a multi-endpoint pool. */
@@ -88,6 +122,12 @@ export function loadDispatchConfig(base: Config, env: NodeJS.ProcessEnv = proces
     vaultDurations,
     antRequiresApproval: (env.ANT_REQUIRES_APPROVAL ?? "true") !== "false",
     pollIntervalMs: parseInt(env.DISPATCH_POLL_INTERVAL_MS ?? "5000", 10),
+    // Never below the poll interval: a monitor cadence faster than the loop
+    // that runs it is just the old every-tick behaviour with extra arithmetic.
+    monitorIntervalMs: Math.max(
+      parseInt(env.DISPATCH_POLL_INTERVAL_MS ?? "5000", 10),
+      parseInt(env.DISPATCH_MONITOR_INTERVAL_MS ?? "60000", 10),
+    ),
     confirmRpcUrl,
   };
 }
