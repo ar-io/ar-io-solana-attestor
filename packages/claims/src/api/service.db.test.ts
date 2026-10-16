@@ -539,6 +539,29 @@ describe("claims API — state machine + concurrency", { skip: HAS_DB ? false : 
     assert.equal(view.name, null);
   });
 
+  it("a retired custody ANT is hidden like an unknown asset (list, getAsset, initiate)", async (t) => {
+    if (!usable) return t.skip("M3 schema not migrated");
+    // A real retired mint (000001). Never touch it on a populated ledger: cleanup
+    // would delete the real row.
+    const antKey = "8G3GrFxzY9uGfoxLurjkJqoXZ4ENsQ9Vi64waWfXQLq";
+    if ((await assetStatus(db, antKey)) !== undefined) return t.skip("retired mint already present in this DB");
+    const id = makeArIdentity();
+    const liveKey = "AntLive" + uid();
+    track(id.recipientId, antKey, liveKey);
+    await insertRecipient(db.pool, { recipientId: id.recipientId, protocol: 0, sourceAddress: id.recipientId, recipientPubkey: id.modulus });
+    await insertAsset(db.pool, id.recipientId, { assetKey: antKey, assetType: "ant", antMint: antKey, antName: "000001" });
+    await insertAsset(db.pool, id.recipientId, { assetKey: liveKey, assetType: "ant", antMint: liveKey, antName: "live" });
+
+    const claimable = await getClaimable(db.pool, { recipientId: id.recipientId });
+    assert.deepEqual(claimable.assets.map((a) => a.assetKey), [liveKey], "retired ANT is not offered");
+    await assert.rejects(getAsset(db.pool, antKey), (e: unknown) => e instanceof ApiError && e.status === 404 && e.code === "ASSET_NOT_FOUND");
+    await assert.rejects(
+      initiateClaim(db.pool, testConfig(), { assetKey: antKey, claimant: randomClaimant() }),
+      (e: unknown) => e instanceof ApiError && e.status === 404 && e.code === "ASSET_NOT_FOUND",
+    );
+    assert.equal(await assetStatus(db, antKey), "available", "row stays available for reconcile parity");
+  });
+
   it("includeClaimed=1 returns claimed assets as history (status+claimTx); default stays available-only", async (t) => {
     if (!usable) return t.skip("M3 schema not migrated");
     const id = makeArIdentity();

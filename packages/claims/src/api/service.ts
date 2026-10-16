@@ -49,6 +49,12 @@ import {
 import { ApiError, fromVerificationError, isApiError } from "./errors.js";
 import { appendAudit } from "./audit.js";
 import { isManuallyDelivered } from "./manually-delivered.js";
+import { isRetiredAnt } from "./retired-ants.js";
+
+/** Hidden from the claim API (404): delivered out-of-band, or a retired custody ANT. */
+function isDelisted(assetKey: string): boolean {
+  return isManuallyDelivered(assetKey) || isRetiredAnt(assetKey);
+}
 
 const ARWEAVE = 0;
 const ETHEREUM = 1;
@@ -355,20 +361,20 @@ export async function getClaimable(
     recipientId: recip.recipient_id,
     protocol: protocolName(recip.protocol),
     sourceAddress: recip.source_address,
-    // Hide out-of-band manually-delivered assets (custody no longer holds them),
+    // Hide out-of-band manually-delivered assets and retired custody ANTs,
     // exactly like manual_review — never offer them for claim.
-    assets: a.rows.filter((row) => !isManuallyDelivered(row.asset_key)).map(claimableViewFromRow),
+    assets: a.rows.filter((row) => !isDelisted(row.asset_key)).map(claimableViewFromRow),
   };
 }
 
-/** GET /v1/assets/{assetKey} — single asset (manual_review + manually-delivered hidden as 404). */
+/** GET /v1/assets/{assetKey} — single asset (manual_review + de-listed hidden as 404). */
 export async function getAsset(pool: Pool, assetKey: string): Promise<ClaimableAssetView> {
   const a = await pool.query<AssetRow>(
     `SELECT ${ASSET_CLAIM_SELECT} WHERE a.asset_key = $1`,
     [assetKey],
   );
   const row = a.rows[0];
-  if (!row || row.status === "manual_review" || isManuallyDelivered(assetKey)) {
+  if (!row || row.status === "manual_review" || isDelisted(assetKey)) {
     throw new ApiError(404, "ASSET_NOT_FOUND", "no self-serve asset with that key");
   }
   return claimableViewFromRow(row);
@@ -412,7 +418,7 @@ export async function initiateClaim(
     // De-listed out-of-band delivery: hide as 404 (byte-identical to unknown asset)
     // BEFORE the status check, so it can never be claimed even while the row stays
     // `available` for reconcile parity.
-    if (isManuallyDelivered(input.assetKey)) throw hiddenAssetError();
+    if (isDelisted(input.assetKey)) throw hiddenAssetError();
     if (asset.status !== "available") throw unavailableError(asset.status);
 
     const recipRow = await loadRecipient(client, asset.recipient_id);
